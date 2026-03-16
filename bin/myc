@@ -813,19 +813,17 @@ def cultivate():
     # Set OS window title via direct escape sequence (not through shell)
     kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
     kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
+    # For Claude Code, skip permission prompts in demo (temp workspace, nothing to protect)
+    demo_cmd = llm_command
+    if "claude" in llm_command.lower():
+        demo_cmd = f"{llm_command} --dangerously-skip-permissions"
     # Launch LLM
-    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
+    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{demo_cmd}\r")
     time.sleep(2)
-    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
+    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{demo_cmd}\r")
 
     print(f"\n  Waiting for agents to initialize...")
-    time.sleep(15)
-
-    # Accept trust prompts if they appear (Claude Code asks on new directories)
-    kitty_send(sock, wid_a, "\r")
-    time.sleep(1)
-    kitty_send(sock, wid_b, "\r")
-    time.sleep(8)
+    time.sleep(10)
 
     # Inject opening prompt into agent A
     opening = f"Introduce yourself to {name_b} and start a fun conversation."
