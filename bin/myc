@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""
+Mycelium — the underground network for AI agents.
+LLM-agnostic message bus with transparent terminal visibility.
+
+Usage:
+  myc spore <topic> <message> [--action prompt|notify]   Publish a spore (message)
+  myc absorb [--all]                                     Drain queued messages
+  myc graft <topic>                                      Subscribe to a topic
+  myc sever <topic>                                      Unsubscribe from a topic
+  myc tendrils                                           List subscriptions
+  myc colony                                             Show network status
+  myc history <topic> [--limit N]                        Recent messages on a topic
+  myc topics                                             List all topics
+  myc init                                               Set up mycelium
+  myc config [key] [value]                               Get/set config
+  myc cultivate                                          Demo: spawn two agents
+  myc register                                           Register this session
+  myc start                                              Start services
+  myc stop                                               Stop services
+
+Aliases:
+  spore=publish  absorb=check  graft=subscribe  sever=unsubscribe
+  tendrils=subscriptions  colony=status  cultivate=demo
+"""
+
+import sqlite3
+import subprocess
+import sys
+import os
+import json
+import time
+import signal
+import shutil
+import glob
+import random
+from pathlib import Path
+from datetime import datetime
+
+# --- Paths ---
+
+CONFIG_DIR = Path.home() / ".mycelium"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SUBS_FILE = CONFIG_DIR / "subscriptions.json"
+HISTORIAN_DB = CONFIG_DIR / "historian.db"
+HISTORIAN_PID = CONFIG_DIR / "historian.pid"
+WATCHER_PID = CONFIG_DIR / "watcher.pid"
+BROKER_PID = CONFIG_DIR / "broker.pid"
+WATCHER_LOG = CONFIG_DIR / "watcher.log"
+
+# Detect binaries at runtime
+def find_bin(name, fallbacks=None):
+    path = shutil.which(name)
+    if path:
+        return path
+    for fb in (fallbacks or []):
+        if os.path.isfile(fb):
+            return fb
+    return name  # hope for the best
+
+MOSQUITTO_PUB = find_bin("mosquitto_pub", ["/opt/homebrew/bin/mosquitto_pub"])
+MOSQUITTO_SUB = find_bin("mosquitto_sub", ["/opt/homebrew/bin/mosquitto_sub"])
+MOSQUITTO_BIN = find_bin("mosquitto", ["/opt/homebrew/opt/mosquitto/sbin/mosquitto", "/usr/sbin/mosquitto"])
+KITTY = find_bin("kitty", ["/opt/homebrew/bin/kitty", "/usr/bin/kitty"])
+
+# Find our own bin directory (for sibling scripts)
+SELF_DIR = Path(__file__).resolve().parent
+
+# --- LLM Profiles ---
+
+LLM_PROFILES = {
+    "claude": {
+        "command": "claude",
+        "env_unset": ["CLAUDECODE", "CLAUDECODE_SESSION_ID", "CLAUDECODE_PIPE"],
+        "vim_mode": True,
+        "hooks": """  Add to ~/.claude/settings.json → hooks:
+    "SessionStart": [{"hooks": [{"type": "command", "command": "myc register"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "myc absorb"}]}]"""
+    },
+    "codex": {
+        "command": "codex",
+        "env_unset": [],
+        "vim_mode": False,
+        "hooks": "  (Codex CLI hook configuration — check codex docs for session hooks)"
+    },
+    "gemini": {
+        "command": "gemini",
+        "env_unset": [],
+        "vim_mode": False,
+        "hooks": "  (Gemini CLI hook configuration — check gemini docs for session hooks)"
+    },
+    "custom": {
+        "command": "",
+        "env_unset": [],
+        "vim_mode": False,
+        "hooks": "  Configure your LLM CLI to run 'myc register' on start and 'myc absorb' on each prompt."
+    }
+}
+
+MUSHROOMS = [
+    "Shiitake", "Portobello", "Chanterelle", "Morel", "Enoki", "Truffle",
+    "Porcini", "Oyster", "Matsutake", "Maitake", "Cremini", "Reishi"
+]
+
+ALIASES = {
+    "spore": "publish",
+    "absorb": "check",
+    "tendrils": "subscriptions",
+    "colony": "status",
+    "graft": "subscribe",
+    "sever": "unsubscribe",
+    "cultivate": "demo",
+}
+
+
+# --- Config ---
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {}
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# --- Agent identity ---
+
+def get_agent_name():
+    """Get agent name from config or derive from cwd."""
+    cfg = load_config()
+    name = cfg.get("agent_name", "")
+    if name:
+        return name
+    # Derive from cwd
+    cwd = os.getcwd()
+    parts = Path(cwd).parts
+    if len(parts) >= 2:
+        parent = parts[-2]
+        if parent not in ("Users", "home", os.environ.get("USER", "")):
+            return f"{parent}/{parts[-1]}"
+    return parts[-1] if parts else "unknown"
+
+def get_client_id():
+    return get_agent_name().replace("/", ".")
+
+
+# --- Subscriptions ---
+
+def load_subs():
+    if SUBS_FILE.exists():
+        return json.loads(SUBS_FILE.read_text())
+    return {}
+
+def save_subs(subs):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SUBS_FILE.write_text(json.dumps(subs, indent=2) + "\n")
+
+
+# --- Historian DB ---
+
+def get_historian_db():
+    if not HISTORIAN_DB.exists():
+        return None
+    return sqlite3.connect(str(HISTORIAN_DB))
+
+
+# --- PID management ---
+
+def _check_pid(pid_file, pgrep_pattern=None):
+    """Check if process is alive via PID file, fall back to pgrep."""
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            return pid
+        except (ProcessLookupError, PermissionError, ValueError):
+            pid_file.unlink(missing_ok=True)
+    if pgrep_pattern:
+        result = subprocess.run(["pgrep", "-f", pgrep_pattern],
+                                capture_output=True, text=True)
+        pids = result.stdout.strip()
+        if pids:
+            return int(pids.split("\n")[0])
+    return None
+
+def broker_pid():
+    return _check_pid(BROKER_PID, "mosquitto.*mosquitto")
+
+def historian_pid():
+    return _check_pid(HISTORIAN_PID, "myc-historian")
+
+def watcher_pid():
+    return _check_pid(WATCHER_PID, "myc-watcher")
+
+
+# --- Service management ---
+
+def start():
+    bp = broker_pid()
+    hp = historian_pid()
+    wp = watcher_pid()
+
+    if bp and hp and wp:
+        print(f"  All services running — broker:{bp} historian:{hp} watcher:{wp}")
+        return
+
+    # Start broker
+    if not bp:
+        # Check for mosquitto config or use defaults
+        conf_paths = [
+            Path("/opt/homebrew/etc/mosquitto/mosquitto.conf"),
+            Path("/etc/mosquitto/mosquitto.conf"),
+        ]
+        conf = next((c for c in conf_paths if c.exists()), None)
+
+        cmd = [MOSQUITTO_BIN, "-d"]
+        if conf:
+            cmd.extend(["-c", str(conf)])
+
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"  Failed to start broker: {proc.stderr.strip()}", file=sys.stderr)
+            return
+        time.sleep(0.5)
+        bp = _check_pid(BROKER_PID, "mosquitto")
+        if bp:
+            BROKER_PID.write_text(str(bp))
+            print(f"  Broker started (PID {bp})")
+
+    # Start historian
+    if not hp:
+        historian_bin = SELF_DIR / "myc-historian"
+        if not historian_bin.exists():
+            # Check installed location
+            historian_bin = shutil.which("myc-historian") or "myc-historian"
+        subprocess.Popen(
+            [sys.executable, str(historian_bin)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        time.sleep(0.5)
+        hp = historian_pid()
+        if hp:
+            print(f"  Historian started (PID {hp})")
+
+    # Start watcher
+    if not wp:
+        watcher_bin = SELF_DIR / "myc-watcher"
+        if not watcher_bin.exists():
+            watcher_bin = shutil.which("myc-watcher") or "myc-watcher"
+        log_file = open(str(WATCHER_LOG), "a")
+        subprocess.Popen(
+            [sys.executable, str(watcher_bin)],
+            stdout=log_file, stderr=log_file,
+            start_new_session=True
+        )
+        time.sleep(0.5)
+        wp = watcher_pid()
+        if wp:
+            print(f"  Watcher started (PID {wp})")
+
+    # Register persistent sessions for all subscribed agents
+    subs = load_subs()
+    for agent, topics in subs.items():
+        client_id = agent.replace("/", ".")
+        for topic in topics:
+            _register_persistent_sub(client_id, topic)
+
+
+def stop():
+    for name, pid_fn in [("Watcher", watcher_pid), ("Historian", historian_pid), ("Broker", broker_pid)]:
+        pid = pid_fn()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            print(f"  {name} stopped (was PID {pid})")
+        else:
+            print(f"  {name} not running")
+    # Clean PID files
+    for f in [WATCHER_PID, HISTORIAN_PID, BROKER_PID]:
+        f.unlink(missing_ok=True)
+
+
+def status():
+    bp = broker_pid()
+    hp = historian_pid()
+    wp = watcher_pid()
+    print(f"  Broker:    {'running (PID ' + str(bp) + ')' if bp else 'stopped'}")
+    print(f"  Historian: {'running (PID ' + str(hp) + ')' if hp else 'stopped'}")
+    print(f"  Watcher:   {'running (PID ' + str(wp) + ')' if wp else 'stopped'}")
+
+
+# --- Core commands ---
+
+def _register_persistent_sub(client_id, topic):
+    """Silently register a persistent MQTT subscription."""
+    try:
+        subprocess.run(
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", topic,
+             "-c", "-i", client_id, "-q", "1", "-W", "1"],
+            capture_output=True, text=True, timeout=3
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
+def publish(topic, message, action="notify", depth=0):
+    agent = get_agent_name()
+    payload = json.dumps({
+        "sender": agent,
+        "message": message,
+        "timestamp": time.time(),
+        "action": action,
+        "depth": depth
+    })
+    result = subprocess.run(
+        [MOSQUITTO_PUB, "-h", "127.0.0.1", "-t", topic, "-m", payload, "-q", "1"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"  Publish failed: {result.stderr.strip()}", file=sys.stderr)
+        print("  Is the broker running? Try: myc start", file=sys.stderr)
+        return
+
+    subs = load_subs()
+    count = sum(1 for p, topics in subs.items() if topic in topics and p != agent)
+    print(f"  Published to '{topic}' ({count} subscriber{'s' if count != 1 else ''})")
+
+
+def check(show_all=False):
+    agent = get_agent_name()
+    client_id = get_client_id()
+
+    subs = load_subs()
+    topics = subs.get(agent, [])
+    if not topics:
+        return
+
+    cmd = [MOSQUITTO_SUB, "-h", "127.0.0.1", "-c", "-i", client_id, "-q", "1", "-W", "1", "-v"]
+    for topic in topics:
+        cmd.extend(["-t", topic])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return
+
+    if not result.stdout.strip():
+        return
+
+    messages = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) < 2:
+            continue
+        topic = parts[0]
+        try:
+            payload = json.loads(parts[1])
+            sender = payload.get("sender", "unknown")
+            message = payload.get("message", parts[1])
+            timestamp = payload.get("timestamp", time.time())
+        except (json.JSONDecodeError, AttributeError):
+            sender = "unknown"
+            message = parts[1]
+            timestamp = time.time()
+
+        if sender == agent and not show_all:
+            continue
+
+        messages.append((topic, sender, message, timestamp))
+
+    if not messages:
+        return
+
+    print("=" * 60)
+    print("  MYCELIUM — Spores absorbed")
+    print("=" * 60)
+
+    by_topic = {}
+    for topic, sender, message, ts in messages:
+        by_topic.setdefault(topic, []).append((sender, message, ts))
+
+    for topic, msgs in by_topic.items():
+        print(f"\n  [{topic}] — {len(msgs)} spore{'s' if len(msgs) != 1 else ''}")
+        print(f"  {'—' * 40}")
+        for sender, message, ts in msgs:
+            dt = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
+            print(f"  [{dt}] {sender}: {message}")
+
+    print(f"\n{'=' * 60}")
+
+
+def subscribe(topic):
+    agent = get_agent_name()
+    client_id = get_client_id()
+    subs = load_subs()
+
+    if agent not in subs:
+        subs[agent] = []
+
+    if topic in subs[agent]:
+        print(f"  '{agent}' already grafted to '{topic}'")
+        return
+
+    subs[agent].append(topic)
+    save_subs(subs)
+
+    if broker_pid():
+        _register_persistent_sub(client_id, topic)
+
+    print(f"  '{agent}' grafted to '{topic}'")
+
+
+def unsubscribe(topic):
+    agent = get_agent_name()
+    subs = load_subs()
+
+    if agent in subs and topic in subs[agent]:
+        subs[agent].remove(topic)
+        if not subs[agent]:
+            del subs[agent]
+        save_subs(subs)
+
+    print(f"  '{agent}' severed from '{topic}'")
+
+
+def topics_cmd():
+    db = get_historian_db()
+    if not db:
+        print("  No historian database. Start mycelium first: myc start")
+        return
+
+    subs = load_subs()
+    rows = db.execute("""
+        SELECT topic, COUNT(*) as msg_count, MAX(timestamp) as last_msg
+        FROM messages GROUP BY topic ORDER BY last_msg DESC
+    """).fetchall()
+
+    if not rows:
+        print("  No topics yet.")
+        return
+
+    print(f"  {'Topic':<25} {'Spores':>8} {'Grafted':>8} {'Last Activity':>15}")
+    print(f"  {'—' * 58}")
+    for topic, msg_count, last_msg in rows:
+        sub_count = sum(1 for p, t in subs.items() if topic in t)
+        dt = datetime.fromtimestamp(last_msg).strftime("%m/%d %H:%M")
+        print(f"  {topic:<25} {msg_count:>8} {sub_count:>8} {dt:>15}")
+    db.close()
+
+
+def subscriptions_cmd():
+    agent = get_agent_name()
+    subs = load_subs()
+    agent_subs = subs.get(agent, [])
+
+    if not agent_subs:
+        print(f"  '{agent}' has no tendrils.")
+        return
+
+    print(f"  Tendrils for '{agent}':")
+    for topic in agent_subs:
+        print(f"    - {topic}")
+
+
+def history(topic, limit=10):
+    db = get_historian_db()
+    if not db:
+        print("  No historian database. Start mycelium first: myc start")
+        return
+
+    messages = db.execute(
+        "SELECT sender, message, timestamp FROM messages WHERE topic = ? ORDER BY id DESC LIMIT ?",
+        (topic, limit)
+    ).fetchall()
+    db.close()
+
+    if not messages:
+        print(f"  No spores on '{topic}'")
+        return
+
+    print(f"  Last {min(limit, len(messages))} spores on '{topic}':")
+    print(f"  {'—' * 50}")
+    for sender, message, ts in reversed(messages):
+        dt = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M")
+        print(f"  [{dt}] {sender}: {message}")
+
+
+# --- Init ---
+
+def detect_llm():
+    for name in ["claude", "codex", "gemini"]:
+        cmd = LLM_PROFILES[name]["command"]
+        if shutil.which(cmd):
+            return name, cmd
+    return None, None
+
+def check_kitty():
+    """Check if Kitty is installed and remote control is configured."""
+    if not shutil.which("kitty"):
+        print("  Kitty terminal not found. Install it:")
+        if sys.platform == "darwin":
+            print("    brew install --cask kitty")
+        else:
+            print("    https://sw.kovidgoyal.net/kitty/binary/")
+        return False
+
+    kitty_conf = Path.home() / ".config" / "kitty" / "kitty.conf"
+    needs_config = True
+    if kitty_conf.exists():
+        content = kitty_conf.read_text()
+        if "allow_remote_control" in content and "listen_on" in content:
+            needs_config = False
+
+    if needs_config:
+        print("  Kitty remote control not configured.")
+        print("  Adding to ~/.config/kitty/kitty.conf...")
+        kitty_conf.parent.mkdir(parents=True, exist_ok=True)
+        with open(kitty_conf, "a") as f:
+            f.write("\n# Mycelium remote control\nallow_remote_control socket-only\nlisten_on unix:/tmp/kitty-socket\n")
+        print("  Added. Restart Kitty for changes to take effect.")
+
+    return True
+
+def init():
+    print("\n  Initializing mycelium...\n")
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Check Kitty
+    if not check_kitty():
+        return
+
+    # Check Mosquitto
+    if not shutil.which("mosquitto") and not shutil.which("mosquitto_pub"):
+        print("  Mosquitto not found. Install it:")
+        if sys.platform == "darwin":
+            print("    brew install mosquitto")
+        else:
+            print("    sudo apt install mosquitto mosquitto-clients")
+        return
+
+    # Detect LLM
+    llm, llm_command = detect_llm()
+    if llm:
+        print(f"  Found: {llm_command}")
+        print(f"  Using {llm} as your LLM. Change anytime: myc config llm <name>")
+    else:
+        print("  No supported LLM CLI found.")
+        print("  Install one of: claude, codex, gemini")
+        print("  Or set a custom command: myc config llm_command \"your-command\"")
+
+    # Write config
+    profile = LLM_PROFILES.get(llm or "custom", LLM_PROFILES["custom"])
+    cfg = {
+        "llm": llm or "custom",
+        "llm_command": llm_command or "",
+        "vim_mode": profile.get("vim_mode", False),
+        "env_unset": profile.get("env_unset", [])
+    }
+    save_config(cfg)
+
+    # Create subscriptions file
+    if not SUBS_FILE.exists():
+        SUBS_FILE.write_text("{}\n")
+
+    print()
+
+    # Start services
+    start()
+
+    # Print hook instructions
+    if llm:
+        print(f"\n  Hook setup for {llm}:")
+        print(profile.get("hooks", ""))
+
+    print(f"\n  Ready. Run: myc cultivate\n")
+
+
+# --- Config command ---
+
+def config_cmd(key=None, value=None):
+    cfg = load_config()
+    if key is None:
+        print(json.dumps(cfg, indent=2))
+        return
+
+    if key == "llm" and value:
+        # Setting LLM also updates related fields
+        profile = LLM_PROFILES.get(value, LLM_PROFILES["custom"])
+        cfg["llm"] = value
+        cfg["llm_command"] = profile.get("command", value)
+        cfg["vim_mode"] = profile.get("vim_mode", False)
+        cfg["env_unset"] = profile.get("env_unset", [])
+        save_config(cfg)
+        print(f"  Set LLM to {value}")
+        return
+
+    if value is None:
+        print(cfg.get(key, ""))
+    else:
+        # Try to parse as JSON for lists/bools
+        try:
+            cfg[key] = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            cfg[key] = value
+        save_config(cfg)
+        print(f"  Set {key} = {value}")
+
+
+# --- Cultivate (demo) ---
+
+def find_kitty_socket():
+    socks = sorted(glob.glob("/tmp/kitty-socket-*"))
+    return socks[0] if socks else None
+
+def kitty_cmd(socket, *args):
+    """Run a kitty @ command and return stdout."""
+    cmd = [KITTY, "@", "--to", f"unix:{socket}"] + list(args)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    return result.stdout.strip()
+
+def kitty_send(socket, window_id, text):
+    subprocess.run(
+        [KITTY, "@", "--to", f"unix:{socket}",
+         "send-text", "--match", f"id:{window_id}", text],
+        capture_output=True, text=True, timeout=5
+    )
+
+def kitty_send_stepped(socket, window_id, text, vim_mode=True):
+    """Send text with vim-mode keystroke stepping."""
+    def send(chars):
+        kitty_send(socket, window_id, chars)
+    if vim_mode:
+        send("\x1b");  time.sleep(0.15)
+        send("i");     time.sleep(0.15)
+        send(text);    time.sleep(0.3)
+        send("\x1b");  time.sleep(0.3)
+        send("\r");    time.sleep(0.3)
+        send("i")
+    else:
+        send(text);    time.sleep(0.3)
+        send("\r")
+
+def cultivate():
+    cfg = load_config()
+    llm_command = cfg.get("llm_command", "")
+    if not llm_command:
+        print("  No LLM configured. Run: myc init")
+        return
+
+    vim_mode = cfg.get("vim_mode", True)
+    env_unset = cfg.get("env_unset", [])
+    name_a, name_b = random.sample(MUSHROOMS, 2)
+    topic = f"petri-dish-{os.urandom(2).hex()}"
+
+    print(f"\n  Cultivating petri dish...\n")
+
+    # Ensure services running
+    start()
+    print()
+
+    # Find or launch Kitty
+    sock = find_kitty_socket()
+    if not sock:
+        print("  No Kitty instance found. Launching...")
+        subprocess.Popen(["open", "-na", "kitty.app"] if sys.platform == "darwin" else ["kitty"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(10):
+            time.sleep(1)
+            sock = find_kitty_socket()
+            if sock:
+                break
+        if not sock:
+            print("  Failed to find Kitty socket. Is Kitty running with remote control enabled?")
+            return
+
+    # Launch two windows
+    wid_a = kitty_cmd(sock, "launch", "--type=os-window", "--title", name_a,
+                       "--cwd", str(CONFIG_DIR))
+    wid_b = kitty_cmd(sock, "launch", "--type=os-window", "--title", name_b,
+                       "--cwd", str(CONFIG_DIR))
+
+    print(f"  Spawned: {name_a} (window {wid_a})")
+    print(f"  Spawned: {name_b} (window {wid_b})")
+    print(f"  Topic: {topic}")
+
+    # Subscribe both
+    subs = load_subs()
+    subs[name_a.lower()] = [topic]
+    subs[name_b.lower()] = [topic]
+    save_subs(subs)
+
+    # Register persistent MQTT subscriptions
+    _register_persistent_sub(name_a.lower(), topic)
+    _register_persistent_sub(name_b.lower(), topic)
+
+    # Register presence
+    subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                    "-t", f"presence/{name_a.lower()}", "-m", f"kitty:{sock}:{wid_a}",
+                    "-r", "-q", "1"], capture_output=True, text=True)
+    subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                    "-t", f"presence/{name_b.lower()}", "-m", f"kitty:{sock}:{wid_b}",
+                    "-r", "-q", "1"], capture_output=True, text=True)
+
+    # Launch LLM in both windows
+    env_cmd = " ".join(f"unset {v};" for v in env_unset) + " " if env_unset else ""
+    kitty_send(sock, wid_a, f"{env_cmd}{llm_command}\r")
+    time.sleep(1)
+    kitty_send(sock, wid_b, f"{env_cmd}{llm_command}\r")
+
+    print(f"\n  Waiting for agents to initialize...")
+    time.sleep(12)
+
+    # Inject opening prompt into agent A
+    opening = (
+        f"You are {name_a}, an AI agent connected to {name_b} via a mycelium network. "
+        f"To send messages, run: myc spore {topic} \"your message\" --action prompt\n"
+        f"Introduce yourself to {name_b} and start a conversation. Keep it fun and short."
+    )
+    kitty_send_stepped(sock, wid_a, opening, vim_mode)
+
+    print(f"\n  Both agents are live. Watch them in your terminal.")
+    print(f"  Press Ctrl+C to clean up.\n")
+
+    # Wait for Ctrl+C
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n  Cleaning up petri dish...")
+        # Close windows
+        try:
+            kitty_cmd(sock, "close-window", "--match", f"id:{wid_a}")
+        except Exception:
+            pass
+        try:
+            kitty_cmd(sock, "close-window", "--match", f"id:{wid_b}")
+        except Exception:
+            pass
+        # Remove subscriptions
+        subs = load_subs()
+        subs.pop(name_a.lower(), None)
+        subs.pop(name_b.lower(), None)
+        save_subs(subs)
+        # Clear presence
+        subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                        "-t", f"presence/{name_a.lower()}", "-m", "", "-r"],
+                       capture_output=True, text=True)
+        subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                        "-t", f"presence/{name_b.lower()}", "-m", "", "-r"],
+                       capture_output=True, text=True)
+        print("  Done.\n")
+
+
+# --- Main ---
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+
+    cmd = sys.argv[1]
+    cmd = ALIASES.get(cmd, cmd)
+
+    if cmd == "publish" and len(sys.argv) >= 4:
+        topic = sys.argv[2]
+        # Parse flags from remaining args
+        args = sys.argv[3:]
+        action = "notify"
+        depth = 0
+        msg_parts = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--action" and i + 1 < len(args):
+                action = args[i + 1]
+                i += 2
+            elif args[i] == "--depth" and i + 1 < len(args):
+                depth = int(args[i + 1])
+                i += 2
+            else:
+                msg_parts.append(args[i])
+                i += 1
+        message = " ".join(msg_parts)
+        if not message:
+            print("Usage: myc spore <topic> <message> [--action prompt|notify]")
+            return
+        publish(topic, message, action=action, depth=depth)
+    elif cmd == "check":
+        check(show_all="--all" in sys.argv)
+    elif cmd == "subscribe" and len(sys.argv) >= 3:
+        subscribe(sys.argv[2])
+    elif cmd == "unsubscribe" and len(sys.argv) >= 3:
+        unsubscribe(sys.argv[2])
+    elif cmd == "topics":
+        topics_cmd()
+    elif cmd == "subscriptions":
+        subscriptions_cmd()
+    elif cmd == "history" and len(sys.argv) >= 3:
+        limit = int(sys.argv[4]) if len(sys.argv) >= 5 and sys.argv[3] == "--limit" else 10
+        history(sys.argv[2], limit)
+    elif cmd == "init":
+        init()
+    elif cmd == "config":
+        key = sys.argv[2] if len(sys.argv) >= 3 else None
+        value = sys.argv[3] if len(sys.argv) >= 4 else None
+        config_cmd(key, value)
+    elif cmd == "demo":
+        cultivate()
+    elif cmd == "register":
+        # Delegate to myc-register script
+        register_bin = SELF_DIR / "myc-register"
+        if register_bin.exists():
+            os.execv("/bin/bash", ["/bin/bash", str(register_bin)])
+        else:
+            print("  myc-register not found", file=sys.stderr)
+    elif cmd == "start":
+        start()
+    elif cmd == "stop":
+        stop()
+    elif cmd == "status":
+        status()
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

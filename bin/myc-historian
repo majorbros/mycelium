@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""
+Mycelium Historian — always-on MQTT subscriber that logs all messages to SQLite.
+Subscribes to '#' (all topics) with a persistent session.
+"""
+
+import sqlite3
+import subprocess
+import sys
+import os
+import json
+import signal
+import shutil
+import time
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".mycelium"
+DB_PATH = CONFIG_DIR / "historian.db"
+PID_FILE = CONFIG_DIR / "historian.pid"
+CLIENT_ID = "mycelium-historian"
+MOSQUITTO_SUB = shutil.which("mosquitto_sub") or "/opt/homebrew/bin/mosquitto_sub"
+
+
+def get_db():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(DB_PATH))
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL,
+            sender TEXT,
+            message TEXT,
+            timestamp REAL,
+            received_at REAL DEFAULT (strftime('%s','now'))
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_msg_topic ON messages(topic)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_msg_timestamp ON messages(timestamp)")
+    db.commit()
+    return db
+
+
+def write_pid():
+    PID_FILE.write_text(str(os.getpid()))
+
+def remove_pid():
+    PID_FILE.unlink(missing_ok=True)
+
+def is_running():
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, ValueError):
+        remove_pid()
+        return False
+
+def handle_signal(signum, frame):
+    remove_pid()
+    sys.exit(0)
+
+
+def main():
+    if "--check" in sys.argv:
+        if is_running():
+            print(f"Historian running (PID {PID_FILE.read_text().strip()})")
+            sys.exit(0)
+        else:
+            print("Historian not running")
+            sys.exit(1)
+
+    if is_running():
+        print(f"Historian already running (PID {PID_FILE.read_text().strip()})")
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    write_pid()
+    db = get_db()
+
+    print(f"Historian started (PID {os.getpid()}), logging to {DB_PATH}")
+
+    while True:
+        try:
+            proc = subprocess.Popen(
+                [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", "#",
+                 "-c", "-i", CLIENT_ID, "-v"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
+                    continue
+                topic = parts[0]
+                try:
+                    payload = json.loads(parts[1])
+                    sender = payload.get("sender", "unknown")
+                    message = payload.get("message", parts[1])
+                    timestamp = payload.get("timestamp", time.time())
+                except (json.JSONDecodeError, AttributeError):
+                    sender = "unknown"
+                    message = parts[1]
+                    timestamp = time.time()
+                db.execute(
+                    "INSERT INTO messages (topic, sender, message, timestamp) VALUES (?, ?, ?, ?)",
+                    (topic, sender, message, timestamp)
+                )
+                db.commit()
+        except Exception as e:
+            print(f"Historian error: {e}, reconnecting in 5s...", file=sys.stderr)
+            time.sleep(5)
+
+    remove_pid()
+
+if __name__ == "__main__":
+    main()

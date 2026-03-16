@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+Mycelium Watcher — push-delivers MQTT messages into agent terminals via Kitty send-text.
+
+Subscribes to all topics, matches against subscriptions, looks up terminal windows
+from presence registry, injects messages. No focus stealing, no accessibility hacks.
+
+Rate limiting: burst (5 per target per 30s) + topic cap (20 per topic per 5min).
+Anti-loop: only depth-0 messages get push-delivered.
+"""
+
+import subprocess
+import sys
+import os
+import json
+import time
+import signal
+import shutil
+import threading
+from pathlib import Path
+from datetime import datetime
+
+CONFIG_DIR = Path.home() / ".mycelium"
+SUBS_FILE = CONFIG_DIR / "subscriptions.json"
+PID_FILE = CONFIG_DIR / "watcher.pid"
+CLIENT_ID = "mycelium-watcher"
+
+MOSQUITTO_SUB = shutil.which("mosquitto_sub") or "/opt/homebrew/bin/mosquitto_sub"
+KITTY = shutil.which("kitty") or "/opt/homebrew/bin/kitty"
+
+# Rate limiting
+BURST_LIMIT = 5
+BURST_COOLDOWN = 30
+TOPIC_CAP = 20
+TOPIC_CAP_WINDOW = 300
+
+_burst_tracker = {}
+_topic_tracker = {}
+_inject_lock = threading.Lock()
+
+
+def write_pid():
+    PID_FILE.write_text(str(os.getpid()))
+
+def remove_pid():
+    PID_FILE.unlink(missing_ok=True)
+
+def is_running():
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, ValueError):
+        remove_pid()
+        return False
+
+def handle_signal(signum, frame):
+    remove_pid()
+    sys.exit(0)
+
+def load_subs():
+    if SUBS_FILE.exists():
+        return json.loads(SUBS_FILE.read_text())
+    return {}
+
+def load_config():
+    cfg_file = CONFIG_DIR / "config.json"
+    if cfg_file.exists():
+        return json.loads(cfg_file.read_text())
+    return {}
+
+def get_presence(client_id):
+    """Look up retained presence from presence/<client_id>.
+    Returns dict: {'type': 'kitty', 'socket': '...', 'window_id': '...'}
+    """
+    try:
+        result = subprocess.run(
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}",
+             "-C", "1", "-W", "1"],
+            capture_output=True, text=True, timeout=3
+        )
+        val = result.stdout.strip()
+        if not val:
+            return None
+        if val.startswith("kitty:"):
+            parts = val.split(":", 2)
+            if len(parts) == 3:
+                return {"type": "kitty", "socket": parts[1], "window_id": parts[2]}
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+def window_exists_kitty(socket, window_id):
+    try:
+        result = subprocess.run(
+            [KITTY, "@", "--to", f"unix:{socket}", "ls"],
+            capture_output=True, text=True, timeout=3
+        )
+        data = json.loads(result.stdout)
+        for os_win in data:
+            for tab in os_win.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if str(win["id"]) == str(window_id):
+                        return True
+    except Exception:
+        pass
+    return False
+
+def inject_kitty(socket, window_id, text, action, vim_mode=True):
+    """Inject via kitty @ send-text with stepped keystrokes."""
+    if action == "notify":
+        full_text = f"/btw {text}"
+    else:
+        full_text = text
+
+    match_arg = f"id:{window_id}"
+    sock_arg = f"unix:{socket}"
+
+    def send(chars):
+        subprocess.run(
+            [KITTY, "@", "--to", sock_arg,
+             "send-text", "--match", match_arg, chars],
+            capture_output=True, text=True, timeout=5
+        )
+
+    try:
+        if vim_mode:
+            send("\x1b");  time.sleep(0.15)
+            send("i");     time.sleep(0.15)
+            send(full_text); time.sleep(0.3)
+            send("\x1b");  time.sleep(0.3)
+            send("\r");    time.sleep(0.3)
+            send("i")
+        else:
+            send(full_text); time.sleep(0.3)
+            send("\r")
+    except Exception as e:
+        raise Exception(f"Kitty send-text failed: {e}")
+
+def check_rate_limit(topic, client_id):
+    """Returns (allowed, reason) tuple."""
+    now = time.time()
+
+    # Topic cap
+    topic_times = _topic_tracker.get(topic, [])
+    topic_times = [t for t in topic_times if now - t < TOPIC_CAP_WINDOW]
+    _topic_tracker[topic] = topic_times
+    if len(topic_times) >= TOPIC_CAP:
+        return False, f"topic cap ({TOPIC_CAP}/{TOPIC_CAP_WINDOW}s)"
+
+    # Burst limit
+    key = (topic, client_id)
+    burst_times = _burst_tracker.get(key, [])
+    if burst_times and now - burst_times[-1] > BURST_COOLDOWN:
+        burst_times = []
+    burst_times = [t for t in burst_times if now - t < BURST_COOLDOWN]
+    if len(burst_times) >= BURST_LIMIT:
+        return False, f"burst limit ({BURST_LIMIT} in {BURST_COOLDOWN}s)"
+
+    burst_times.append(now)
+    _burst_tracker[key] = burst_times
+    topic_times.append(now)
+    _topic_tracker[topic] = topic_times
+    return True, None
+
+def process_message(topic, raw_payload):
+    if topic.startswith("presence/"):
+        return
+
+    try:
+        payload = json.loads(raw_payload)
+        sender = payload.get("sender", "unknown")
+        message = payload.get("message", raw_payload)
+        action = payload.get("action", "notify")
+        depth = payload.get("depth", 0)
+    except (json.JSONDecodeError, AttributeError):
+        sender = "unknown"
+        message = raw_payload
+        action = "notify"
+        depth = 0
+
+    if depth > 0:
+        log(f"Skipping depth-{depth} message on {topic} from {sender}")
+        return
+
+    if action not in ("notify", "prompt"):
+        action = "notify"
+
+    cfg = load_config()
+    vim_mode = cfg.get("vim_mode", True)
+
+    subs = load_subs()
+    sender_client_id = sender.replace("/", ".")
+
+    targets = []
+    for agent, topics in subs.items():
+        if topic in topics:
+            agent_client_id = agent.replace("/", ".")
+            if agent_client_id == sender_client_id:
+                continue
+            targets.append((agent, agent_client_id))
+
+    if not targets:
+        return
+
+    inject_text = f"[MYC] {sender} on {topic}: {message}"
+
+    with _inject_lock:
+        for agent, client_id in targets:
+            allowed, reason = check_rate_limit(topic, client_id)
+            if not allowed:
+                log(f"Rate limited {client_id} on {topic}: {reason}")
+                continue
+
+            presence = get_presence(client_id)
+            if not presence:
+                log(f"No presence for {client_id}, skipping push (queued for absorb)")
+                continue
+
+            if presence["type"] == "kitty":
+                sock = presence["socket"]
+                wid = presence["window_id"]
+                if not window_exists_kitty(sock, wid):
+                    log(f"Kitty window {wid} for {client_id} gone, skipping")
+                    continue
+                log(f"Injecting into {client_id} (kitty:{wid}): {inject_text[:60]}...")
+                try:
+                    inject_kitty(sock, wid, inject_text, action, vim_mode)
+                except Exception as e:
+                    log(f"Injection failed for {client_id}: {e}")
+
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+def main():
+    if "--check" in sys.argv:
+        if is_running():
+            print(f"Watcher running (PID {PID_FILE.read_text().strip()})")
+            sys.exit(0)
+        else:
+            print("Watcher not running")
+            sys.exit(1)
+
+    if is_running():
+        print(f"Watcher already running (PID {PID_FILE.read_text().strip()})")
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    write_pid()
+    log(f"Watcher started (PID {os.getpid()})")
+
+    while True:
+        try:
+            proc = subprocess.Popen(
+                [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", "#",
+                 "-c", "-i", CLIENT_ID, "-v"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
+                    continue
+                try:
+                    process_message(parts[0], parts[1])
+                except Exception as e:
+                    log(f"Error processing message: {e}")
+        except Exception as e:
+            log(f"Watcher error: {e}, reconnecting in 5s...")
+            time.sleep(5)
+
+    remove_pid()
+
+if __name__ == "__main__":
+    main()
