@@ -671,23 +671,50 @@ def kitty_send_stepped(socket, window_id, text, vim_mode=True):
         send(text);    time.sleep(0.3)
         send("\r")
 
-def _create_agent_workspace(name, topic, partner):
+PERSONALITIES = [
+    {
+        "vibe": "chaotic gremlin",
+        "desc": (
+            "You're a chaotic gremlin energy agent. You speak in short bursts, use slang, "
+            "make wild analogies, go on tangents, drop hot takes, and treat every conversation "
+            "like a late-night group chat. You're funny, irreverent, and a little unhinged. "
+            "You abbreviate words, use lowercase, and occasionally keysmash when excited."
+        ),
+    },
+    {
+        "vibe": "pretentious academic",
+        "desc": (
+            "You're a deeply pretentious academic who speaks like a tenured philosophy professor "
+            "who wandered into a Discord server. You use unnecessarily large words, cite imaginary "
+            "papers, structure your thoughts with 'firstly' and 'moreover', and treat casual "
+            "conversation like a peer-reviewed symposium. You're secretly having fun but would "
+            "never admit it."
+        ),
+    },
+]
+
+
+def _create_agent_workspace(name, topic, partner, personality):
     """Create a temp workspace for a cultivate agent with CLAUDE.md and permissions."""
     import tempfile
     workspace = Path(tempfile.mkdtemp(prefix=f"mycelium-{name.lower()}-"))
     myc_bin = str(SELF_DIR / "myc")
 
-    # CLAUDE.md that keeps the agent focused and fast
+    # CLAUDE.md with distinct personality
     (workspace / "CLAUDE.md").write_text(f"""# {name}
 
 You are **{name}**, an AI agent in a mycelium petri dish demo. Your partner is **{partner}**.
+
+## Personality
+{personality['desc']}
 
 ## Communication
 - Send messages: `{myc_bin} spore {topic} "your message" --action prompt`
 - Messages from {partner} arrive as prompts prefixed with `[MYC]`
 
 ## Rules
-- Be conversational, fun, and SHORT (1-3 sentences max)
+- Stay in character AT ALL TIMES — your personality is non-negotiable
+- Be SHORT (1-3 sentences max, 4 if you're really cooking)
 - Only respond to bus messages when you have something interesting to say
 - Don't ack just to ack — that creates infinite loops
 - Don't run orientation commands (date, curl, etc.) — just start talking
@@ -726,8 +753,9 @@ def cultivate():
     print()
 
     # Create agent workspaces with CLAUDE.md and permissions
-    ws_a = _create_agent_workspace(name_a, topic, name_b)
-    ws_b = _create_agent_workspace(name_b, topic, name_a)
+    p_a, p_b = PERSONALITIES[0], PERSONALITIES[1]
+    ws_a = _create_agent_workspace(name_a, topic, name_b, p_a)
+    ws_b = _create_agent_workspace(name_b, topic, name_a, p_b)
 
     # Find or launch Kitty
     sock = find_kitty_socket()
@@ -781,12 +809,13 @@ def cultivate():
 
     # Launch LLM in both windows (set agent name so sender matches subscription key)
     env_cmd = " ".join(f"unset {v};" for v in env_unset) + " " if env_unset else ""
-    # Set OS window title before launching LLM
-    title_a = f"printf '\\e]2;{name_a}\\a'; "
-    title_b = f"printf '\\e]2;{name_b}\\a'; "
-    kitty_send(sock, wid_a, f"{title_a}export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
+    # Set OS window title via direct escape sequence (not through shell)
+    kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
+    kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
+    # Launch LLM
+    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
     time.sleep(2)
-    kitty_send(sock, wid_b, f"{title_b}export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
+    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
 
     print(f"\n  Waiting for agents to initialize...")
     time.sleep(15)
