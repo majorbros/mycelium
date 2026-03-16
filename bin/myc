@@ -823,7 +823,14 @@ def cultivate():
     kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{demo_cmd}\r")
 
     print(f"\n  Waiting for agents to initialize...")
-    time.sleep(10)
+    time.sleep(5)
+
+    # Auto-accept trust dialog if it appears (sends "y" then enter)
+    if "claude" in llm_command.lower():
+        kitty_send(sock, wid_a, "y")
+        time.sleep(0.5)
+        kitty_send(sock, wid_b, "y")
+        time.sleep(8)
 
     # Inject opening prompt into agent A
     opening = f"Introduce yourself to {name_b} and start a fun conversation."
