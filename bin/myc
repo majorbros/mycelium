@@ -7,7 +7,8 @@ Usage:
   myc spore <topic> <message> [--action prompt|notify]   Publish a spore (message)
   myc absorb [--all]                                     Drain queued messages
   myc graft <topic>                                      Subscribe to a topic
-  myc sever <topic>                                      Unsubscribe from a topic
+  myc sever <topic> [--agent <name>]                      Unsubscribe from a topic
+  myc prune <agent>                                      Remove an agent and all its subscriptions
   myc tendrils                                           List subscriptions
   myc colony                                             Show network status
   myc history <topic> [--limit N]                        Recent messages on a topic
@@ -418,8 +419,9 @@ def subscribe(topic):
     print(f"  '{agent}' grafted to '{topic}'")
 
 
-def unsubscribe(topic):
-    agent = get_agent_name()
+def unsubscribe(topic, agent=None):
+    if not agent:
+        agent = get_agent_name()
     subs = load_subs()
 
     if agent in subs and topic in subs[agent]:
@@ -429,6 +431,26 @@ def unsubscribe(topic):
         save_subs(subs)
 
     print(f"  '{agent}' severed from '{topic}'")
+
+
+def prune(agent_name):
+    """Remove an agent and all its subscriptions + presence."""
+    subs = load_subs()
+    if agent_name not in subs:
+        print(f"  No agent '{agent_name}' found.")
+        print(f"  Available: {', '.join(subs.keys()) or '(none)'}")
+        return
+
+    topics = subs.pop(agent_name)
+    save_subs(subs)
+
+    # Clear presence
+    client_id = agent_name.replace("/", ".")
+    subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                    "-t", f"presence/{client_id}", "-m", "", "-r"],
+                   capture_output=True, text=True)
+
+    print(f"  Pruned '{agent_name}' — removed {len(topics)} subscription(s): {', '.join(topics)}")
 
 
 def topics_cmd():
@@ -728,6 +750,13 @@ def cultivate():
     wid_b = kitty_cmd(sock, "launch", "--type=os-window", "--title", name_b,
                        "--cwd", str(ws_b))
 
+    # Force window titles (shell can override --title from launch)
+    kitty_cmd(sock, "set-window-title", "--match", f"id:{wid_a}", name_a)
+    kitty_cmd(sock, "set-window-title", "--match", f"id:{wid_b}", name_b)
+    # Also set OS window title bar via ANSI escape
+    kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
+    kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
+
     print(f"  Spawned: {name_a} (window {wid_a})")
     print(f"  Spawned: {name_b} (window {wid_b})")
     print(f"  Topic: {topic}")
@@ -752,9 +781,12 @@ def cultivate():
 
     # Launch LLM in both windows (set agent name so sender matches subscription key)
     env_cmd = " ".join(f"unset {v};" for v in env_unset) + " " if env_unset else ""
-    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
+    # Set OS window title before launching LLM
+    title_a = f"printf '\\e]2;{name_a}\\a'; "
+    title_b = f"printf '\\e]2;{name_b}\\a'; "
+    kitty_send(sock, wid_a, f"{title_a}export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
     time.sleep(2)
-    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
+    kitty_send(sock, wid_b, f"{title_b}export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
 
     print(f"\n  Waiting for agents to initialize...")
     time.sleep(15)
@@ -848,7 +880,14 @@ def main():
     elif cmd == "subscribe" and len(sys.argv) >= 3:
         subscribe(sys.argv[2])
     elif cmd == "unsubscribe" and len(sys.argv) >= 3:
-        unsubscribe(sys.argv[2])
+        agent_override = None
+        if "--agent" in sys.argv:
+            idx = sys.argv.index("--agent")
+            if idx + 1 < len(sys.argv):
+                agent_override = sys.argv[idx + 1]
+        unsubscribe(sys.argv[2], agent=agent_override)
+    elif cmd == "prune" and len(sys.argv) >= 3:
+        prune(sys.argv[2])
     elif cmd == "topics":
         topics_cmd()
     elif cmd == "subscriptions":
