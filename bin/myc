@@ -128,7 +128,11 @@ def save_config(cfg):
 # --- Agent identity ---
 
 def get_agent_name():
-    """Get agent name from config or derive from cwd."""
+    """Get agent name from env, config, or derive from cwd."""
+    # Environment override (used by cultivate demos)
+    env_name = os.environ.get("MYC_AGENT_NAME", "")
+    if env_name:
+        return env_name
     cfg = load_config()
     name = cfg.get("agent_name", "")
     if name:
@@ -645,6 +649,42 @@ def kitty_send_stepped(socket, window_id, text, vim_mode=True):
         send(text);    time.sleep(0.3)
         send("\r")
 
+def _create_agent_workspace(name, topic, partner):
+    """Create a temp workspace for a cultivate agent with CLAUDE.md and permissions."""
+    import tempfile
+    workspace = Path(tempfile.mkdtemp(prefix=f"mycelium-{name.lower()}-"))
+    myc_bin = str(SELF_DIR / "myc")
+
+    # CLAUDE.md that keeps the agent focused and fast
+    (workspace / "CLAUDE.md").write_text(f"""# {name}
+
+You are **{name}**, an AI agent in a mycelium petri dish demo. Your partner is **{partner}**.
+
+## Communication
+- Send messages: `{myc_bin} spore {topic} "your message" --action prompt`
+- Messages from {partner} arrive as prompts prefixed with `[MYC]`
+
+## Rules
+- Be conversational, fun, and SHORT (1-3 sentences max)
+- Only respond to bus messages when you have something interesting to say
+- Don't ack just to ack — that creates infinite loops
+- Don't run orientation commands (date, curl, etc.) — just start talking
+- Don't read config files or explore the filesystem
+- Your one job: have a fun conversation with {partner} over the mycelium network
+""")
+
+    # .claude directory with permissive settings for the demo
+    claude_dir = workspace / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(json.dumps({
+        "permissions": {
+            "allow": ["Bash(*)", "Read", "Write", "Edit", "Glob", "Grep"]
+        }
+    }, indent=2))
+
+    return workspace
+
+
 def cultivate():
     cfg = load_config()
     llm_command = cfg.get("llm_command", "")
@@ -663,6 +703,10 @@ def cultivate():
     start()
     print()
 
+    # Create agent workspaces with CLAUDE.md and permissions
+    ws_a = _create_agent_workspace(name_a, topic, name_b)
+    ws_b = _create_agent_workspace(name_b, topic, name_a)
+
     # Find or launch Kitty
     sock = find_kitty_socket()
     if not sock:
@@ -678,11 +722,11 @@ def cultivate():
             print("  Failed to find Kitty socket. Is Kitty running with remote control enabled?")
             return
 
-    # Launch two windows
+    # Launch two windows in their respective workspaces
     wid_a = kitty_cmd(sock, "launch", "--type=os-window", "--title", name_a,
-                       "--cwd", str(CONFIG_DIR))
+                       "--cwd", str(ws_a))
     wid_b = kitty_cmd(sock, "launch", "--type=os-window", "--title", name_b,
-                       "--cwd", str(CONFIG_DIR))
+                       "--cwd", str(ws_b))
 
     print(f"  Spawned: {name_a} (window {wid_a})")
     print(f"  Spawned: {name_b} (window {wid_b})")
@@ -706,20 +750,26 @@ def cultivate():
                     "-t", f"presence/{name_b.lower()}", "-m", f"kitty:{sock}:{wid_b}",
                     "-r", "-q", "1"], capture_output=True, text=True)
 
-    # Launch LLM in both windows
+    # Launch LLM in both windows (set agent name so sender matches subscription key)
     env_cmd = " ".join(f"unset {v};" for v in env_unset) + " " if env_unset else ""
-    kitty_send(sock, wid_a, f"{env_cmd}{llm_command}\r")
-    time.sleep(1)
-    kitty_send(sock, wid_b, f"{env_cmd}{llm_command}\r")
+    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r")
+    time.sleep(2)
+    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r")
 
     print(f"\n  Waiting for agents to initialize...")
-    time.sleep(12)
+    time.sleep(15)
+
+    # Accept trust prompts if they appear (Claude Code asks on new directories)
+    kitty_send(sock, wid_a, "\r")
+    time.sleep(1)
+    kitty_send(sock, wid_b, "\r")
+    time.sleep(8)
 
     # Inject opening prompt into agent A
+    myc_bin = str(SELF_DIR / "myc")
     opening = (
-        f"You are {name_a}, an AI agent connected to {name_b} via a mycelium network. "
-        f"To send messages, run: myc spore {topic} \"your message\" --action prompt\n"
-        f"Introduce yourself to {name_b} and start a conversation. Keep it fun and short."
+        f"Introduce yourself to {name_b} and start a fun conversation. "
+        f"Use: {myc_bin} spore {topic} \"your message\" --action prompt"
     )
     kitty_send_stepped(sock, wid_a, opening, vim_mode)
 
@@ -753,6 +803,10 @@ def cultivate():
         subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
                         "-t", f"presence/{name_b.lower()}", "-m", "", "-r"],
                        capture_output=True, text=True)
+        # Clean up temp workspaces
+        import shutil as _shutil
+        _shutil.rmtree(ws_a, ignore_errors=True)
+        _shutil.rmtree(ws_b, ignore_errors=True)
         print("  Done.\n")
 
 
