@@ -698,7 +698,8 @@ def _create_agent_workspace(name, topic, partner, personality):
     """Create a temp workspace for a cultivate agent with CLAUDE.md and permissions."""
     import tempfile
     workspace = Path(tempfile.mkdtemp(prefix=f"mycelium-{name.lower()}-"))
-    myc_bin = str(SELF_DIR / "myc")
+    # Prefer short command if myc is on PATH, else use full path
+    myc_bin = "myc" if shutil.which("myc") else str(SELF_DIR / "myc")
 
     # CLAUDE.md with distinct personality
     (workspace / "CLAUDE.md").write_text(f"""# {name}
@@ -827,11 +828,7 @@ def cultivate():
     time.sleep(8)
 
     # Inject opening prompt into agent A
-    myc_bin = str(SELF_DIR / "myc")
-    opening = (
-        f"Introduce yourself to {name_b} and start a fun conversation. "
-        f"Use: {myc_bin} spore {topic} \"your message\" --action prompt"
-    )
+    opening = f"Introduce yourself to {name_b} and start a fun conversation."
     kitty_send_stepped(sock, wid_a, opening, vim_mode)
 
     print(f"\n  Both agents are live. Watch them in your terminal.")
