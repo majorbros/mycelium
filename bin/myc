@@ -813,24 +813,21 @@ def cultivate():
     # Set OS window title via direct escape sequence (not through shell)
     kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
     kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
-    # For Claude Code, skip permission prompts in demo (temp workspace, nothing to protect)
-    demo_cmd = llm_command
+    # For Claude Code: pre-trust workspace with -p, then launch interactive session
     if "claude" in llm_command.lower():
+        pre_trust = f"echo hi | {env_cmd}{llm_command} -p --dangerously-skip-permissions 2>/dev/null; "
         demo_cmd = f"{llm_command} --dangerously-skip-permissions"
-    # Launch LLM
-    kitty_send(sock, wid_a, f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{demo_cmd}\r")
+        cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {pre_trust}{demo_cmd}\r"
+        cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {pre_trust}{demo_cmd}\r"
+    else:
+        cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r"
+        cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r"
+    kitty_send(sock, wid_a, cmd_a)
     time.sleep(2)
-    kitty_send(sock, wid_b, f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{demo_cmd}\r")
+    kitty_send(sock, wid_b, cmd_b)
 
     print(f"\n  Waiting for agents to initialize...")
-    time.sleep(5)
-
-    # Auto-accept trust dialog (option 1 is pre-selected, just press enter)
-    if "claude" in llm_command.lower():
-        kitty_send(sock, wid_a, "\r")
-        time.sleep(0.5)
-        kitty_send(sock, wid_b, "\r")
-        time.sleep(10)
+    time.sleep(15)
 
     # Inject opening prompt into agent A
     opening = f"Introduce yourself to {name_b} and start a fun conversation."
