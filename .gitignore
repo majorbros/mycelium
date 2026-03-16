@@ -1,0 +1,6 @@
+.DS_Store
+*.o
+*.pid
+*.db
+__pycache__/
+bin/wait-for-idle
