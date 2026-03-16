@@ -825,12 +825,12 @@ def cultivate():
     print(f"\n  Waiting for agents to initialize...")
     time.sleep(5)
 
-    # Auto-accept trust dialog if it appears (sends "y" then enter)
+    # Auto-accept trust dialog (option 1 is pre-selected, just press enter)
     if "claude" in llm_command.lower():
-        kitty_send(sock, wid_a, "y")
+        kitty_send(sock, wid_a, "\r")
         time.sleep(0.5)
-        kitty_send(sock, wid_b, "y")
-        time.sleep(8)
+        kitty_send(sock, wid_b, "\r")
+        time.sleep(10)
 
     # Inject opening prompt into agent A
     opening = f"Introduce yourself to {name_b} and start a fun conversation."
