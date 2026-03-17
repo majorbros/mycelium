@@ -112,6 +112,26 @@ def window_exists_kitty(socket, window_id):
         pass
     return False
 
+def is_window_focused(socket, window_id):
+    """Check if a kitty window is currently focused."""
+    try:
+        result = subprocess.run(
+            [KITTY, "@", "--to", f"unix:{socket}", "ls"],
+            capture_output=True, text=True, timeout=3
+        )
+        data = json.loads(result.stdout)
+        for os_win in data:
+            if not os_win.get("is_focused"):
+                continue
+            for tab in os_win.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if str(win["id"]) == str(window_id) and win.get("is_focused"):
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 def wait_for_user_idle():
     """Wait for keyboard/mouse inactivity before injecting."""
     if not WAIT_FOR_IDLE:
@@ -242,8 +262,9 @@ def process_message(topic, raw_payload):
                 if not window_exists_kitty(sock, wid):
                     log(f"Kitty window {wid} for {client_id} gone, skipping")
                     continue
-                # Wait for user to stop typing before injecting
-                wait_for_user_idle()
+                # Only wait for idle if user is actively typing in this window
+                if is_window_focused(sock, wid):
+                    wait_for_user_idle()
                 log(f"Injecting into {client_id} (kitty:{wid}): {inject_text[:60]}...")
                 try:
                     inject_kitty(sock, wid, inject_text, action, vim_mode)
