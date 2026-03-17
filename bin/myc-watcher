@@ -27,6 +27,10 @@ CLIENT_ID = "mycelium-watcher"
 
 MOSQUITTO_SUB = shutil.which("mosquitto_sub") or "/opt/homebrew/bin/mosquitto_sub"
 KITTY = shutil.which("kitty") or "/opt/homebrew/bin/kitty"
+WAIT_FOR_IDLE = shutil.which("wait-for-idle")
+
+IDLE_THRESHOLD = 2  # seconds of keyboard/mouse inactivity before injecting
+IDLE_TIMEOUT = 30   # give up waiting after this many seconds
 
 # Rate limiting
 BURST_LIMIT = 5
@@ -107,6 +111,19 @@ def window_exists_kitty(socket, window_id):
     except Exception:
         pass
     return False
+
+def wait_for_user_idle():
+    """Wait for keyboard/mouse inactivity before injecting."""
+    if not WAIT_FOR_IDLE:
+        return
+    try:
+        subprocess.run(
+            [WAIT_FOR_IDLE, str(IDLE_THRESHOLD), str(IDLE_TIMEOUT)],
+            timeout=IDLE_TIMEOUT + 5
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
 
 def inject_kitty(socket, window_id, text, action, vim_mode=True):
     """Inject via kitty @ send-text with stepped keystrokes."""
@@ -225,6 +242,8 @@ def process_message(topic, raw_payload):
                 if not window_exists_kitty(sock, wid):
                     log(f"Kitty window {wid} for {client_id} gone, skipping")
                     continue
+                # Wait for user to stop typing before injecting
+                wait_for_user_idle()
                 log(f"Injecting into {client_id} (kitty:{wid}): {inject_text[:60]}...")
                 try:
                     inject_kitty(sock, wid, inject_text, action, vim_mode)
