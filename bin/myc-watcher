@@ -230,6 +230,7 @@ def process_message(topic, raw_payload):
 
     subs = load_subs()
     sender_client_id = sender.replace("/", ".")
+    sender_presence = get_presence(sender_client_id)
 
     targets = []
     for agent, topics in subs.items():
@@ -255,6 +256,14 @@ def process_message(topic, raw_payload):
             if not presence:
                 log(f"No presence for {client_id}, skipping push (queued for absorb)")
                 continue
+
+            # Window-level self-echo: skip if sender is in the same window
+            # (catches cases where sender name doesn't match subscription key)
+            if sender_presence and presence.get("type") == "kitty" and sender_presence.get("type") == "kitty":
+                if (presence.get("socket") == sender_presence.get("socket") and
+                        presence.get("window_id") == sender_presence.get("window_id")):
+                    log(f"Skipping {client_id}: same window as sender {sender_client_id}")
+                    continue
 
             if presence["type"] == "kitty":
                 sock = presence["socket"]
