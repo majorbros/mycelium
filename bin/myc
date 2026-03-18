@@ -11,6 +11,7 @@ Usage:
   myc prune <agent>                                      Remove an agent and all its subscriptions
   myc tendrils                                           List subscriptions
   myc colony                                             Show who's on the network
+  myc wither <topic> [--keep-history]                     Kill a topic entirely
   myc decompose                                          Clean up stale presences
   myc history <topic> [--limit N]                        Recent messages on a topic
   myc topics                                             List all topics
@@ -481,6 +482,47 @@ def gc():
         save_subs(subs)
 
     print(f"\n  Done. {len(stale)} stale presence(s) cleared.\n")
+
+
+def wither(topic, keep_history=False):
+    """Kill a topic — remove all subscriptions, clear retained messages, purge history."""
+    subs = load_subs()
+
+    # Find and remove all subscriptions to this topic
+    affected = []
+    for agent, topics in list(subs.items()):
+        if topic in topics:
+            topics.remove(topic)
+            affected.append(agent)
+            if not topics:
+                del subs[agent]
+    if affected:
+        save_subs(subs)
+        print(f"  Removed '{topic}' from {len(affected)} agent(s): {', '.join(affected)}")
+    else:
+        print(f"  No agents subscribed to '{topic}'")
+
+    # Clear any retained MQTT messages on the topic
+    subprocess.run(
+        [MOSQUITTO_PUB, "-h", "127.0.0.1", "-t", topic, "-m", "", "-r"],
+        capture_output=True, text=True
+    )
+    print(f"  Cleared retained messages on '{topic}'")
+
+    # Purge from historian DB
+    if not keep_history:
+        db = get_historian_db()
+        if db:
+            count = db.execute("SELECT COUNT(*) FROM messages WHERE topic = ?", (topic,)).fetchone()[0]
+            if count:
+                db.execute("DELETE FROM messages WHERE topic = ?", (topic,))
+                db.commit()
+                print(f"  Purged {count} message(s) from history")
+            db.close()
+    else:
+        print(f"  History preserved (--keep-history)")
+
+    print(f"\n  '{topic}' has withered.\n")
 
 
 # --- Core commands ---
@@ -1135,6 +1177,8 @@ def main():
         colony()
     elif cmd in ("decompose", "gc"):
         gc()
+    elif cmd == "wither" and len(sys.argv) >= 3:
+        wither(sys.argv[2], keep_history="--keep-history" in sys.argv)
     else:
         print(__doc__)
 
