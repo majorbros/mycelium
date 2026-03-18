@@ -25,12 +25,6 @@ fi
 
 client_id=$(echo "$agent_name" | tr '/' '.')
 
-# Find Kitty socket
-kitty_sock=$(ls /tmp/kitty-socket-* 2>/dev/null | head -1)
-if [ -z "$kitty_sock" ]; then
-    exit 0  # No Kitty running, skip silently
-fi
-
 # Walk process tree to find Kitty ancestor
 pid=$$
 kitty_pid=""
@@ -45,64 +39,61 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     pid="$ppid"
 done
 
-if [ -z "$kitty_pid" ]; then
-    # Not running inside Kitty — try Ghostty fallback
-    pid=$$
-    ghostty_pid=""
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-        [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ] && break
-        comm=$(ps -o comm= -p "$ppid" 2>/dev/null)
-        if [[ "$comm" == *ghostty* ]] || [[ "$comm" == *Ghostty* ]]; then
-            ghostty_pid="$ppid"
-            break
-        fi
-        pid="$ppid"
-    done
-
-    if [ -n "$ghostty_pid" ] && command -v aerospace >/dev/null 2>&1; then
-        window_id=$(aerospace list-windows --all --format '%{window-id} %{app-pid}' 2>/dev/null | awk -v pid="$ghostty_pid" '$2 == pid {print $1; exit}')
-        if [ -n "$window_id" ]; then
-            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "$window_id" -r -q 1 2>/dev/null
-        fi
+if [ -n "$kitty_pid" ]; then
+    # Find which socket belongs to our Kitty parent by matching PID to socket name
+    # Kitty sockets are named /tmp/kitty-socket-<PID>
+    kitty_sock="/tmp/kitty-socket-$kitty_pid"
+    if [ ! -S "$kitty_sock" ]; then
+        # Fallback: check all sockets and find the one whose PID matches
+        for sock in /tmp/kitty-socket-*; do
+            sock_pid="${sock##*-}"
+            if [ "$sock_pid" = "$kitty_pid" ]; then
+                kitty_sock="$sock"
+                break
+            fi
+        done
     fi
-    exit 0
-fi
 
-# Find Kitty window ID for our PID
-window_id=$("$KITTY" @ --to "unix:$kitty_sock" ls 2>/dev/null | python3 -c "
+    if [ -S "$kitty_sock" ]; then
+        # Get the window ID — with one window per instance, just grab the first one
+        window_id=$("$KITTY" @ --to "unix:$kitty_sock" ls 2>/dev/null | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
-    target_pid = $kitty_pid
     for os_win in data:
         for tab in os_win.get('tabs', []):
             for win in tab.get('windows', []):
-                # Check if any foreground process is a descendant of our kitty pid
-                for proc in win.get('foreground_processes', []):
-                    if proc.get('pid') == $$ or any(str($$) in str(c) for c in proc.get('cmdline', [])):
-                        print(win['id'])
-                        sys.exit(0)
-    # Fallback: match by PID of the shell
-    for os_win in data:
-        for tab in os_win.get('tabs', []):
-            for win in tab.get('windows', []):
-                if win.get('pid') == $$:
-                    print(win['id'])
-                    sys.exit(0)
-                for proc in win.get('foreground_processes', []):
-                    if proc.get('pid') == $$:
-                        print(win['id'])
-                        sys.exit(0)
-except Exception:
-    pass
+                print(win['id'])
+                sys.exit(0)
+except: pass
 " 2>/dev/null)
 
-if [ -z "$window_id" ]; then
-    exit 0
+        if [ -n "$window_id" ]; then
+            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
+            exit 0
+        fi
+    fi
 fi
 
-# Publish presence as kitty:<socket>:<window_id>
-"$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
+# Ghostty fallback
+pid=$$
+ghostty_pid=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ] && break
+    comm=$(ps -o comm= -p "$ppid" 2>/dev/null)
+    if [[ "$comm" == *ghostty* ]] || [[ "$comm" == *Ghostty* ]]; then
+        ghostty_pid="$ppid"
+        break
+    fi
+    pid="$ppid"
+done
+
+if [ -n "$ghostty_pid" ] && command -v aerospace >/dev/null 2>&1; then
+    window_id=$(aerospace list-windows --all --format '%{window-id} %{app-pid}' 2>/dev/null | awk -v pid="$ghostty_pid" '$2 == pid {print $1; exit}')
+    if [ -n "$window_id" ]; then
+        "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "$window_id" -r -q 1 2>/dev/null
+    fi
+fi
 
 exit 0
