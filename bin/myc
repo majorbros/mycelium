@@ -10,7 +10,8 @@ Usage:
   myc sever <topic> [--agent <name>]                      Unsubscribe from a topic
   myc prune <agent>                                      Remove an agent and all its subscriptions
   myc tendrils                                           List subscriptions
-  myc colony                                             Show network status
+  myc colony                                             Show who's on the network
+  myc gc                                                 Clean up stale presences
   myc history <topic> [--limit N]                        Recent messages on a topic
   myc topics                                             List all topics
   myc init                                               Set up mycelium
@@ -107,7 +108,7 @@ ALIASES = {
     "spore": "publish",
     "absorb": "check",
     "tendrils": "subscriptions",
-    "colony": "status",
+    "colony": "network",
     "graft": "subscribe",
     "sever": "unsubscribe",
     "cultivate": "demo",
@@ -343,6 +344,143 @@ def status():
     print(f"  Broker:    {'running (PID ' + str(bp) + ')' if bp else 'stopped'}")
     print(f"  Historian: {'running (PID ' + str(hp) + ')' if hp else 'stopped'}")
     print(f"  Watcher:   {'running (PID ' + str(wp) + ')' if wp else 'stopped'}")
+
+
+def _get_all_presences():
+    """Fetch all retained presence messages from the broker."""
+    try:
+        result = subprocess.run(
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", "presence/#", "-W", "2", "-v"],
+            capture_output=True, text=True, timeout=5
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    presences = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            continue
+        # presence/agent.name → agent.name
+        agent = parts[0].replace("presence/", "").replace(".", "/", 1)
+        presences[agent] = parts[1].strip()
+    return presences
+
+
+def _check_presence_alive(value):
+    """Check if a presence value points to a live terminal. Returns (alive, backend)."""
+    if value.startswith("kitty:"):
+        # kitty:<socket>:<window_id>
+        parts = value.split(":")
+        if len(parts) < 3:
+            return False, "kitty"
+        socket_path, wid = parts[1], parts[2]
+        if not Path(socket_path).exists():
+            return False, "kitty"
+        try:
+            result = subprocess.run(
+                [KITTY, "@", "--to", f"unix:{socket_path}",
+                 "ls", "--match", f"id:{wid}"],
+                capture_output=True, text=True, timeout=3
+            )
+            return result.returncode == 0 and result.stdout.strip() != "[]", "kitty"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False, "kitty"
+    else:
+        # Plain integer = old Ghostty window ID, always stale now
+        return False, "ghostty"
+
+
+def colony():
+    """Show who's on the network with liveness status."""
+    presences = _get_all_presences()
+    subs = load_subs()
+
+    if not presences and not subs:
+        print("  No agents on the network.")
+        return
+
+    # Check liveness for all presences
+    agents = {}
+    for agent, value in presences.items():
+        alive, backend = _check_presence_alive(value)
+        agents[agent] = {"presence": value, "alive": alive, "backend": backend}
+
+    # Add agents that have subscriptions but no presence
+    for agent in subs:
+        if agent not in agents:
+            agents[agent] = {"presence": None, "alive": False, "backend": None}
+
+    alive_count = sum(1 for a in agents.values() if a["alive"])
+    total = len(agents)
+
+    print(f"\n  Colony — {alive_count}/{total} agents alive\n")
+    print(f"  {'Agent':<35} {'Status':<10} {'Backend':<10} {'Topics'}")
+    print(f"  {'—' * 75}")
+
+    for agent in sorted(agents.keys()):
+        info = agents[agent]
+        if info["alive"]:
+            status_str = "alive"
+        elif info["presence"]:
+            status_str = "stale"
+        else:
+            status_str = "offline"
+        backend = info["backend"] or "—"
+        topics = ", ".join(subs.get(agent, [])) or "—"
+        print(f"  {agent:<35} {status_str:<10} {backend:<10} {topics}")
+
+    print()
+
+
+def gc():
+    """Garbage collect stale presences and orphaned subscriptions."""
+    presences = _get_all_presences()
+
+    if not presences:
+        print("  No presences to clean.")
+        return
+
+    stale = []
+    alive = []
+    for agent, value in presences.items():
+        is_alive, backend = _check_presence_alive(value)
+        if is_alive:
+            alive.append(agent)
+        else:
+            stale.append((agent, value, backend))
+
+    if not stale:
+        print(f"  All {len(alive)} presences are alive. Nothing to clean.")
+        return
+
+    print(f"\n  Found {len(stale)} stale presence(s):\n")
+    for agent, value, backend in stale:
+        print(f"    {agent} ({backend}: {value})")
+
+    print()
+
+    for agent, value, backend in stale:
+        client_key = agent.replace("/", ".")
+        subprocess.run(
+            [MOSQUITTO_PUB, "-h", "127.0.0.1",
+             "-t", f"presence/{client_key}", "-m", "", "-r"],
+            capture_output=True, text=True
+        )
+        print(f"  Cleared presence/{client_key}")
+
+    # Check for orphaned subscriptions (agents with no presence and no live session)
+    subs = load_subs()
+    orphaned = [a for a in subs if a not in [x for x in alive] and a.startswith("T/") or a.startswith("T.")]
+    if orphaned:
+        print(f"\n  Found {len(orphaned)} orphaned demo subscription(s):")
+        for agent in orphaned:
+            topics = subs.pop(agent)
+            print(f"    Removed {agent} ({', '.join(topics)})")
+        save_subs(subs)
+
+    print(f"\n  Done. {len(stale)} stale presence(s) cleared.\n")
 
 
 # --- Core commands ---
@@ -993,6 +1131,10 @@ def main():
         stop()
     elif cmd == "status":
         status()
+    elif cmd == "network":
+        colony()
+    elif cmd == "gc":
+        gc()
     else:
         print(__doc__)
 
