@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""
+Mycelium service launcher — starts watcher and historian as child processes.
+Used by Homebrew service and launchd. Stays in foreground, forwards SIGTERM.
+"""
+
+import os
+import sys
+import signal
+import subprocess
+from pathlib import Path
+
+SELF_DIR = Path(__file__).resolve().parent
+
+def main():
+    python = sys.executable
+    watcher = str(SELF_DIR / "myc-watcher")
+    historian = str(SELF_DIR / "myc-historian")
+
+    procs = []
+    for script in [watcher, historian]:
+        if not Path(script).exists():
+            print(f"  Missing: {script}", file=sys.stderr)
+            continue
+        p = subprocess.Popen([python, script])
+        procs.append(p)
+        print(f"  Started {Path(script).name} (PID {p.pid})")
+
+    def shutdown(signum, frame):
+        for p in procs:
+            try:
+                p.terminate()
+            except ProcessLookupError:
+                pass
+        for p in procs:
+            p.wait(timeout=5)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    # Wait for children — if either dies, let launchd restart us
+    for p in procs:
+        p.wait()
+
+
+if __name__ == "__main__":
+    main()
