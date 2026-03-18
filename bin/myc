@@ -18,13 +18,13 @@ Usage:
   myc init                                               Set up mycelium
   myc config [key] [value]                               Get/set config
   myc cultivate                                          Demo: spawn two agents
-  myc register                                           Register this session
+  myc germinate                                          Register this session
   myc start                                              Start services
   myc stop                                               Stop services
 
 Aliases:
   spore=publish  absorb=check  graft=subscribe  sever=unsubscribe
-  tendrils=subscriptions  colony=status  cultivate=demo
+  tendrils=subscriptions  colony=status  cultivate=demo  germinate=register
 """
 
 import sqlite3
@@ -1175,7 +1175,7 @@ def main():
         config_cmd(key, value)
     elif cmd == "demo":
         cultivate()
-    elif cmd == "register":
+    elif cmd in ("germinate", "register"):
         # Delegate to myc-register script
         register_bin = SELF_DIR / "myc-register"
         if register_bin.exists():
