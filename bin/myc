@@ -988,6 +988,9 @@ def cultivate():
         print("  No LLM configured. Run: myc init")
         return
 
+    # Clean up any stale presences/subscriptions from previous demos
+    gc()
+
     vim_mode = cfg.get("vim_mode", True)
     env_unset = cfg.get("env_unset", [])
     name_a, name_b = random.sample(MUSHROOMS, 2)
