@@ -11,7 +11,7 @@ Usage:
   myc prune <agent>                                      Remove an agent and all its subscriptions
   myc tendrils                                           List subscriptions
   myc colony                                             Show who's on the network
-  myc gc                                                 Clean up stale presences
+  myc decompose                                          Clean up stale presences
   myc history <topic> [--limit N]                        Recent messages on a topic
   myc topics                                             List all topics
   myc init                                               Set up mycelium
@@ -1133,7 +1133,7 @@ def main():
         status()
     elif cmd == "network":
         colony()
-    elif cmd == "gc":
+    elif cmd in ("decompose", "gc"):
         gc()
     else:
         print(__doc__)
