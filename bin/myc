@@ -202,6 +202,35 @@ def watcher_pid():
 
 # --- Service management ---
 
+def _is_brew_formula(name):
+    """Check if a formula is installed via Homebrew."""
+    brew = shutil.which("brew")
+    if not brew:
+        return False
+    result = subprocess.run([brew, "list", name], capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def _brew_service_start(name):
+    """Start a Homebrew service. Returns True if successful."""
+    brew = shutil.which("brew")
+    if not brew:
+        return False
+    result = subprocess.run([brew, "services", "start", name],
+                            capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def _brew_service_stop(name):
+    """Stop a Homebrew service."""
+    brew = shutil.which("brew")
+    if not brew:
+        return False
+    result = subprocess.run([brew, "services", "stop", name],
+                            capture_output=True, text=True)
+    return result.returncode == 0
+
+
 def start():
     bp = broker_pid()
     hp = historian_pid()
@@ -211,60 +240,72 @@ def start():
         print(f"  All services running — broker:{bp} historian:{hp} watcher:{wp}")
         return
 
+    use_brew = _is_brew_formula("mycelium")
+
     # Start broker
     if not bp:
-        # Check for mosquitto config or use defaults
-        conf_paths = [
-            Path("/opt/homebrew/etc/mosquitto/mosquitto.conf"),
-            Path("/etc/mosquitto/mosquitto.conf"),
-        ]
-        conf = next((c for c in conf_paths if c.exists()), None)
+        if _is_brew_formula("mosquitto"):
+            if _brew_service_start("mosquitto"):
+                time.sleep(0.5)
+                bp = broker_pid()
+                if bp:
+                    print(f"  Broker started via brew services (PID {bp})")
+        if not bp:
+            conf_paths = [
+                Path("/opt/homebrew/etc/mosquitto/mosquitto.conf"),
+                Path("/etc/mosquitto/mosquitto.conf"),
+            ]
+            conf = next((c for c in conf_paths if c.exists()), None)
+            cmd = [MOSQUITTO_BIN, "-d"]
+            if conf:
+                cmd.extend(["-c", str(conf)])
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"  Failed to start broker: {proc.stderr.strip()}", file=sys.stderr)
+                return
+            time.sleep(0.5)
+            bp = _check_pid(BROKER_PID, "mosquitto")
+            if bp:
+                BROKER_PID.write_text(str(bp))
+                print(f"  Broker started (PID {bp})")
 
-        cmd = [MOSQUITTO_BIN, "-d"]
-        if conf:
-            cmd.extend(["-c", str(conf)])
-
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            print(f"  Failed to start broker: {proc.stderr.strip()}", file=sys.stderr)
-            return
-        time.sleep(0.5)
-        bp = _check_pid(BROKER_PID, "mosquitto")
-        if bp:
-            BROKER_PID.write_text(str(bp))
-            print(f"  Broker started (PID {bp})")
-
-    # Start historian
-    if not hp:
-        historian_bin = SELF_DIR / "myc-historian"
-        if not historian_bin.exists():
-            # Check installed location
-            historian_bin = shutil.which("myc-historian") or "myc-historian"
-        subprocess.Popen(
-            [sys.executable, str(historian_bin)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True
-        )
-        time.sleep(0.5)
-        hp = historian_pid()
-        if hp:
-            print(f"  Historian started (PID {hp})")
-
-    # Start watcher
-    if not wp:
-        watcher_bin = SELF_DIR / "myc-watcher"
-        if not watcher_bin.exists():
-            watcher_bin = shutil.which("myc-watcher") or "myc-watcher"
-        log_file = open(str(WATCHER_LOG), "a")
-        subprocess.Popen(
-            [sys.executable, str(watcher_bin)],
-            stdout=log_file, stderr=log_file,
-            start_new_session=True
-        )
-        time.sleep(0.5)
-        wp = watcher_pid()
-        if wp:
-            print(f"  Watcher started (PID {wp})")
+    # Start watcher + historian
+    if not hp or not wp:
+        if use_brew:
+            if _brew_service_start("mycelium"):
+                time.sleep(1)
+                hp = historian_pid()
+                wp = watcher_pid()
+                if hp and wp:
+                    print(f"  Services started via brew services (historian:{hp} watcher:{wp})")
+        # Fallback to direct launch if brew services didn't work or not available
+        if not hp:
+            historian_bin = SELF_DIR / "myc-historian"
+            if not historian_bin.exists():
+                historian_bin = shutil.which("myc-historian") or "myc-historian"
+            subprocess.Popen(
+                [sys.executable, str(historian_bin)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            time.sleep(0.5)
+            hp = historian_pid()
+            if hp:
+                print(f"  Historian started (PID {hp})")
+        if not wp:
+            watcher_bin = SELF_DIR / "myc-watcher"
+            if not watcher_bin.exists():
+                watcher_bin = shutil.which("myc-watcher") or "myc-watcher"
+            log_file = open(str(WATCHER_LOG), "a")
+            subprocess.Popen(
+                [sys.executable, str(watcher_bin)],
+                stdout=log_file, stderr=log_file,
+                start_new_session=True
+            )
+            time.sleep(0.5)
+            wp = watcher_pid()
+            if wp:
+                print(f"  Watcher started (PID {wp})")
 
     # Register persistent sessions for all subscribed agents
     subs = load_subs()
@@ -275,13 +316,21 @@ def start():
 
 
 def stop():
-    for name, pid_fn in [("Watcher", watcher_pid), ("Historian", historian_pid), ("Broker", broker_pid)]:
-        pid = pid_fn()
-        if pid:
-            os.kill(pid, signal.SIGTERM)
-            print(f"  {name} stopped (was PID {pid})")
-        else:
-            print(f"  {name} not running")
+    use_brew = _is_brew_formula("mycelium")
+
+    if use_brew:
+        _brew_service_stop("mycelium")
+        _brew_service_stop("mosquitto")
+        print("  Services stopped via brew services")
+    else:
+        for name, pid_fn in [("Watcher", watcher_pid), ("Historian", historian_pid), ("Broker", broker_pid)]:
+            pid = pid_fn()
+            if pid:
+                os.kill(pid, signal.SIGTERM)
+                print(f"  {name} stopped (was PID {pid})")
+            else:
+                print(f"  {name} not running")
+
     # Clean PID files
     for f in [WATCHER_PID, HISTORIAN_PID, BROKER_PID]:
         f.unlink(missing_ok=True)
