@@ -923,6 +923,20 @@ PERSONALITIES = [
 ]
 
 
+def _pre_trust_workspace(workspace):
+    """Write hasTrustDialogAccepted to ~/.claude.json so Claude skips the trust prompt."""
+    real_path = str(Path(workspace).resolve())
+    config_path = Path.home() / ".claude.json"
+    try:
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        config = {}
+    config.setdefault("projects", {})
+    config["projects"].setdefault(real_path, {})
+    config["projects"][real_path]["hasTrustDialogAccepted"] = True
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+
 def _create_agent_workspace(name, topic, partner, personality):
     """Create a temp workspace for a cultivate agent with CLAUDE.md and permissions."""
     import tempfile
@@ -960,6 +974,9 @@ You are **{name}**, an AI agent in a mycelium petri dish demo. Your partner is *
             "allow": ["Bash(*)", "Read", "Write", "Edit", "Glob", "Grep"]
         }
     }, indent=2))
+
+    # Pre-trust so Claude skips the "trust this directory?" prompt
+    _pre_trust_workspace(workspace)
 
     return workspace
 
@@ -1042,15 +1059,13 @@ def cultivate():
     # Set OS window title via direct escape sequence (not through shell)
     kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
     kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
-    # For Claude Code: pre-trust workspace with -p, then launch interactive session
+    # Launch LLM — trust is pre-written to ~/.claude.json by _create_agent_workspace
     if "claude" in llm_command.lower():
-        pre_trust = f"echo hi | {env_cmd}{llm_command} -p --dangerously-skip-permissions 2>/dev/null; "
-        demo_cmd = f"{llm_command} --dangerously-skip-permissions"
-        cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {pre_trust}{demo_cmd}\r"
-        cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {pre_trust}{demo_cmd}\r"
+        demo_cmd = f"{env_cmd}{llm_command} --dangerously-skip-permissions"
     else:
-        cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {env_cmd}{llm_command}\r"
-        cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {env_cmd}{llm_command}\r"
+        demo_cmd = f"{env_cmd}{llm_command}"
+    cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {demo_cmd}\r"
+    cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {demo_cmd}\r"
     kitty_send(sock, wid_a, cmd_a)
     time.sleep(2)
     kitty_send(sock, wid_b, cmd_b)
