@@ -13,7 +13,7 @@ Usage:
   myc colony                                             Show who's on the network
   myc wither <topic> [--keep-history]                     Kill a topic entirely
   myc decompose                                          Clean up stale presences
-  myc route                                              Show all agents and their topics
+  myc hyphae                                             Show all agents and their topics
   myc history <topic> [--limit N]                        Recent messages on a topic
   myc topics                                             List all topics
   myc init                                               Set up mycelium
@@ -26,6 +26,7 @@ Usage:
 Aliases:
   spore=publish  absorb=check  graft=subscribe  sever=unsubscribe
   tendrils=subscriptions  colony=status  cultivate=demo  germinate=register
+  hyphae=routes
 """
 
 import sqlite3
@@ -1190,7 +1191,7 @@ def main():
         topics_cmd()
     elif cmd == "subscriptions":
         subscriptions_cmd()
-    elif cmd == "route":
+    elif cmd in ("hyphae", "route", "routes"):
         route()
     elif cmd == "history" and len(sys.argv) >= 3:
         limit = int(sys.argv[4]) if len(sys.argv) >= 5 and sys.argv[3] == "--limit" else 10
