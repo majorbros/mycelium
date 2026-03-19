@@ -1087,31 +1087,50 @@ def cultivate():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n  Cleaning up petri dish...")
+
+        # Kill processes in the windows first (Ctrl+C then Ctrl+D to exit claude + shell)
+        for wid in [wid_a, wid_b]:
+            try:
+                kitty_send(sock, wid, "\x03")  # Ctrl+C
+                time.sleep(0.5)
+                kitty_send(sock, wid, "\x03")  # Ctrl+C again (in case nested)
+                time.sleep(0.5)
+                kitty_send(sock, wid, "\x04")  # Ctrl+D to exit shell
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+        time.sleep(1)
+
         # Close windows
-        try:
-            kitty_cmd(sock, "close-window", "--match", f"id:{wid_a}")
-        except Exception:
-            pass
-        try:
-            kitty_cmd(sock, "close-window", "--match", f"id:{wid_b}")
-        except Exception:
-            pass
+        for wid in [wid_a, wid_b]:
+            try:
+                kitty_cmd(sock, "close-window", "--match", f"id:{wid}")
+            except Exception:
+                pass
+
         # Remove subscriptions
         subs = load_subs()
         subs.pop(name_a.lower(), None)
         subs.pop(name_b.lower(), None)
         save_subs(subs)
+
         # Clear presence
+        for name in [name_a.lower(), name_b.lower()]:
+            subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                            "-t", f"presence/{name}", "-m", "", "-r"],
+                           capture_output=True, text=True)
+
+        # Wither the petri dish topic
         subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                        "-t", f"presence/{name_a.lower()}", "-m", "", "-r"],
+                        "-t", topic, "-m", "", "-r"],
                        capture_output=True, text=True)
-        subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                        "-t", f"presence/{name_b.lower()}", "-m", "", "-r"],
-                       capture_output=True, text=True)
+
         # Clean up temp workspaces
         import shutil as _shutil
         _shutil.rmtree(ws_a, ignore_errors=True)
         _shutil.rmtree(ws_b, ignore_errors=True)
+
         print("  Done.\n")
 
 
