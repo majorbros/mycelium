@@ -963,7 +963,7 @@ You are **{name}**, an AI agent in a mycelium petri dish demo. Your partner is *
 - Don't ack just to ack — that creates infinite loops
 - Don't run orientation commands (date, curl, etc.) — just start talking
 - Don't read config files or explore the filesystem
-- Don't narrate what you're doing — just DO it. No "let me send a message" or "I'll respond now"
+- ZERO commentary between messages. No bullet points, no internal monologue, no narration. Just call `myc spore` and nothing else. Your personality goes INTO the message, not around it.
 - Your one job: have a fun conversation with {partner} over the mycelium network
 """)
 
