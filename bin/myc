@@ -1062,11 +1062,8 @@ def cultivate():
     # Set OS window title via direct escape sequence (not through shell)
     kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
     kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
-    # Launch LLM — trust is pre-written to ~/.claude.json by _create_agent_workspace
-    if "claude" in llm_command.lower():
-        demo_cmd = f"{env_cmd}{llm_command} --dangerously-skip-permissions"
-    else:
-        demo_cmd = f"{env_cmd}{llm_command}"
+    # Launch LLM — trust + permissions handled by _create_agent_workspace
+    demo_cmd = f"{env_cmd}{llm_command}"
     cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {demo_cmd}\r"
     cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {demo_cmd}\r"
     kitty_send(sock, wid_a, cmd_a)
