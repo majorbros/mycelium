@@ -70,6 +70,10 @@ except: pass
 
         if [ -n "$window_id" ]; then
             "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
+            # Pin agent name to this window so it persists across cwd changes
+            session_dir="$CONFIG_DIR/sessions"
+            mkdir -p "$session_dir"
+            echo "$agent_name" > "$session_dir/${kitty_sock##*/}:${window_id}"
             exit 0
         fi
     fi

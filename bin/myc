@@ -132,12 +132,62 @@ def save_config(cfg):
 
 # --- Agent identity ---
 
+_session_name_cache = None
+_session_name_checked = False
+
+def _get_session_agent_name():
+    """Look up agent name pinned at registration time for this kitty window."""
+    global _session_name_cache, _session_name_checked
+    if _session_name_checked:
+        return _session_name_cache
+    _session_name_checked = True
+    session_dir = CONFIG_DIR / "sessions"
+    if not session_dir.exists():
+        return None
+    # Walk process tree to find our Kitty parent, then match session file
+    pid = os.getpid()
+    kitty_pid = None
+    for _ in range(10):
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2
+            )
+            ppid = result.stdout.strip()
+            if not ppid or ppid in ("0", "1"):
+                break
+            comm_result = subprocess.run(
+                ["ps", "-o", "comm=", "-p", ppid],
+                capture_output=True, text=True, timeout=2
+            )
+            comm = comm_result.stdout.strip()
+            if "kitty" in comm.lower():
+                kitty_pid = ppid
+                break
+            pid = int(ppid)
+        except Exception:
+            break
+    if not kitty_pid:
+        return None
+    # Check session files for this kitty socket
+    sock_name = f"kitty-socket-{kitty_pid}"
+    for session_file in session_dir.iterdir():
+        if session_file.name.startswith(sock_name + ":"):
+            _session_name_cache = session_file.read_text().strip()
+            return _session_name_cache
+    return None
+
+
 def get_agent_name():
-    """Get agent name from env, config, or derive from cwd."""
+    """Get agent name from env, session pin, config, or derive from cwd."""
     # Environment override (used by cultivate demos)
     env_name = os.environ.get("MYC_AGENT_NAME", "")
     if env_name:
         return env_name
+    # Session pin (set at registration, survives cwd changes)
+    session_name = _get_session_agent_name()
+    if session_name:
+        return session_name
     cfg = load_config()
     name = cfg.get("agent_name", "")
     if name:
@@ -482,6 +532,22 @@ def gc():
             topics = subs.pop(agent)
             print(f"    Removed {agent} ({', '.join(topics)})")
         save_subs(subs)
+
+    # Clean stale session pin files
+    session_dir = CONFIG_DIR / "sessions"
+    if session_dir.exists():
+        stale_sessions = 0
+        for sf in session_dir.iterdir():
+            # Session files are named kitty-socket-<pid>:<window_id>
+            parts = sf.name.split(":")
+            if len(parts) == 2:
+                sock_part = parts[0]  # kitty-socket-<pid>
+                sock_path = f"/tmp/{sock_part}"
+                if not Path(sock_path).exists():
+                    sf.unlink()
+                    stale_sessions += 1
+        if stale_sessions:
+            print(f"  Cleaned {stale_sessions} stale session pin(s).")
 
     print(f"\n  Done. {len(stale)} stale presence(s) cleared.\n")
 
