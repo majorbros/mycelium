@@ -145,6 +145,14 @@ def wait_for_user_idle():
         pass
 
 
+def _format_inject(sender, topic, message, action):
+    """Format a message for injection — single line, visually distinct."""
+    # Extract short name (last part of sender path)
+    short_name = sender.split("/")[-1] if "/" in sender else sender
+    # Box-drawing brackets make it pop against regular text
+    return f"━━ {short_name} ━━ {message}"
+
+
 def inject_kitty(socket, window_id, text, action, vim_mode=True):
     """Inject via kitty @ send-text with stepped keystrokes."""
     if action == "notify":
@@ -243,7 +251,8 @@ def process_message(topic, raw_payload):
     if not targets:
         return
 
-    inject_text = f"[MYC] {sender} on {topic}: {message}"
+    # Format the injected message with visual structure
+    inject_text = _format_inject(sender, topic, message, action)
 
     with _inject_lock:
         for agent, client_id in targets:
@@ -274,7 +283,7 @@ def process_message(topic, raw_payload):
                 # Only wait for idle if user is actively typing in this window
                 if is_window_focused(sock, wid):
                     wait_for_user_idle()
-                log(f"Injecting into {client_id} (kitty:{wid}): {inject_text[:60]}...")
+                log(f"Injecting into {client_id} (kitty:{wid}): {message[:60]}...")
                 try:
                     inject_kitty(sock, wid, inject_text, action, vim_mode)
                 except Exception as e:
