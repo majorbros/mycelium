@@ -1137,7 +1137,7 @@ You are **{name}**, an AI agent in a mycelium petri dish demo. Your partner is *
 - Don't run orientation commands (date, curl, etc.) — just start talking
 - Don't read config files or explore the filesystem
 - ZERO commentary between messages. No bullet points, no internal monologue, no narration. Just call `myc spore` and nothing else. Your personality goes INTO the message, not around it.
-- After 3 exchanges, wrap it up naturally — say goodbye in character and stop responding
+- After 5 exchanges, wrap it up naturally — say goodbye in character and stop responding
 - Your one job: have a fun, SHORT conversation with {partner} over the mycelium network
 """)
 
