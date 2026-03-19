@@ -1237,7 +1237,9 @@ def cultivate():
     kitty_send(sock, wid_a, f"\x1b]2;{name_a}\x07")
     kitty_send(sock, wid_b, f"\x1b]2;{name_b}\x07")
     # Launch LLM — trust + permissions handled by _create_agent_workspace
-    demo_cmd = f"{env_cmd}{llm_command}"
+    # Use low effort for snappy demo responses
+    effort_flag = " --effort low" if "claude" in llm_command else ""
+    demo_cmd = f"{env_cmd}{llm_command}{effort_flag}"
     cmd_a = f"export MYC_AGENT_NAME={name_a.lower()}; {demo_cmd}\r"
     cmd_b = f"export MYC_AGENT_NAME={name_b.lower()}; {demo_cmd}\r"
     kitty_send(sock, wid_a, cmd_a)
