@@ -38,8 +38,12 @@ BURST_COOLDOWN = 30
 TOPIC_CAP = 20
 TOPIC_CAP_WINDOW = 300
 
+# Conversation TTL — kill delivery on a topic after this many minutes of continuous activity
+CONVERSATION_TTL = 30  # minutes
+
 _burst_tracker = {}
 _topic_tracker = {}
+_topic_first_seen = {}  # topic → timestamp of first message in current active window
 _inject_lock = threading.Lock()
 
 
@@ -187,6 +191,17 @@ def inject_kitty(socket, window_id, text, action, vim_mode=True):
 def check_rate_limit(topic, client_id):
     """Returns (allowed, reason) tuple."""
     now = time.time()
+    ttl_seconds = CONVERSATION_TTL * 60
+
+    # Conversation TTL — if a topic has been continuously active too long, cut it off
+    # Resets if topic has been quiet for 10+ minutes
+    first_seen = _topic_first_seen.get(topic)
+    topic_times_check = _topic_tracker.get(topic, [])
+    last_activity = topic_times_check[-1] if topic_times_check else None
+    if first_seen is None or (last_activity and now - last_activity > 600):
+        _topic_first_seen[topic] = now
+    elif now - first_seen > ttl_seconds:
+        return False, f"conversation TTL ({CONVERSATION_TTL}min) — topic has been active too long"
 
     # Topic cap
     topic_times = _topic_tracker.get(topic, [])
