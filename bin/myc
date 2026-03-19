@@ -13,7 +13,7 @@ Usage:
   myc colony                                             Show who's on the network
   myc wither <topic> [--keep-history]                     Kill a topic entirely
   myc decompose                                          Clean up stale presences
-  myc route <agent>                                      Find shared topics with an agent
+  myc route                                              Show all agents and their topics
   myc history <topic> [--limit N]                        Recent messages on a topic
   myc topics                                             List all topics
   myc init                                               Set up mycelium
@@ -722,37 +722,14 @@ def subscriptions_cmd():
         print(f"    - {topic}")
 
 
-def route(target_agent):
-    """Find shared topics between current agent and target agent."""
-    me = get_agent_name()
+def route():
+    """Show the full network topology — all agents and their topics."""
     subs = load_subs()
-    my_topics = set(subs.get(me, []))
-
-    # Find target — try exact match first, then partial match
-    target_topics = set()
-    matched_name = None
-    for agent, topics in subs.items():
-        if agent == target_agent or agent.endswith(f"/{target_agent}") or agent.split("/")[-1] == target_agent:
-            target_topics = set(topics)
-            matched_name = agent
-            break
-
-    if not matched_name:
-        print(f"  No agent matching '{target_agent}' found.")
-        print(f"  Known agents: {', '.join(subs.keys())}")
+    if not subs:
+        print("  No subscriptions.")
         return
-
-    shared = my_topics & target_topics
-    if shared:
-        print(f"  {me} <-> {matched_name}:")
-        for topic in sorted(shared):
-            print(f"    topic: {topic}")
-    else:
-        print(f"  No shared topics between '{me}' and '{matched_name}'.")
-        if my_topics:
-            print(f"  Your topics: {', '.join(sorted(my_topics))}")
-        if target_topics:
-            print(f"  Their topics: {', '.join(sorted(target_topics))}")
+    for agent, topics in sorted(subs.items()):
+        print(f"  {agent}: {', '.join(topics)}")
 
 
 def history(topic, limit=10):
@@ -1213,8 +1190,8 @@ def main():
         topics_cmd()
     elif cmd == "subscriptions":
         subscriptions_cmd()
-    elif cmd == "route" and len(sys.argv) >= 3:
-        route(sys.argv[2])
+    elif cmd == "route":
+        route()
     elif cmd == "history" and len(sys.argv) >= 3:
         limit = int(sys.argv[4]) if len(sys.argv) >= 5 and sys.argv[3] == "--limit" else 10
         history(sys.argv[2], limit)
