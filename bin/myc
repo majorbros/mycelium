@@ -543,13 +543,33 @@ def _register_persistent_sub(client_id, topic):
 
 def publish(topic, message, action="notify", depth=0):
     agent = get_agent_name()
-    payload = json.dumps({
+    client_id = get_client_id()
+    # Embed sender's presence so the watcher can do window-level echo detection
+    # even when the sender name doesn't match the subscription key
+    sender_presence = None
+    try:
+        result = subprocess.run(
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}",
+             "-C", "1", "-W", "1"],
+            capture_output=True, text=True, timeout=3
+        )
+        val = result.stdout.strip()
+        if val and val.startswith("kitty:"):
+            parts = val.split(":", 2)
+            if len(parts) == 3:
+                sender_presence = {"type": "kitty", "socket": parts[1], "window_id": parts[2]}
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    msg = {
         "sender": agent,
         "message": message,
         "timestamp": time.time(),
         "action": action,
         "depth": depth
-    })
+    }
+    if sender_presence:
+        msg["sender_presence"] = sender_presence
+    payload = json.dumps(msg)
     result = subprocess.run(
         [MOSQUITTO_PUB, "-h", "127.0.0.1", "-t", topic, "-m", payload, "-q", "1"],
         capture_output=True, text=True

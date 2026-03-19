@@ -220,11 +220,13 @@ def process_message(topic, raw_payload):
         message = payload.get("message", raw_payload)
         action = payload.get("action", "notify")
         depth = payload.get("depth", 0)
+        embedded_presence = payload.get("sender_presence")
     except (json.JSONDecodeError, AttributeError):
         sender = "unknown"
         message = raw_payload
         action = "notify"
         depth = 0
+        embedded_presence = None
 
     if depth > 0:
         log(f"Skipping depth-{depth} message on {topic} from {sender}")
@@ -239,6 +241,9 @@ def process_message(topic, raw_payload):
     subs = load_subs()
     sender_client_id = sender.replace("/", ".")
     sender_presence = get_presence(sender_client_id)
+    # Fall back to embedded presence from payload (handles name mismatches)
+    if not sender_presence and embedded_presence:
+        sender_presence = embedded_presence
 
     targets = []
     for agent, topics in subs.items():
