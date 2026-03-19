@@ -839,12 +839,92 @@ def init():
     # Start services
     start()
 
-    # Print hook instructions
-    if llm:
-        print(f"\n  Hook setup for {llm}:")
-        print(profile.get("hooks", ""))
+    # Auto-configure LLM hooks
+    if llm == "claude":
+        _setup_claude_hooks()
+        _setup_claude_instructions()
 
     print(f"\n  Ready. Run: myc cultivate\n")
+
+
+def _setup_claude_hooks():
+    """Add mycelium hooks to ~/.claude/settings.json."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text())
+    else:
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+
+    # Check if myc hooks already exist
+    def _has_myc_hook(hook_list, cmd_substr):
+        for group in hook_list:
+            for hook in group.get("hooks", []):
+                if cmd_substr in hook.get("command", ""):
+                    return True
+        return False
+
+    # Add SessionStart hook for germinate
+    session_hooks = hooks.setdefault("SessionStart", [])
+    if not _has_myc_hook(session_hooks, "myc"):
+        session_hooks.append({
+            "hooks": [{"type": "command", "command": "myc germinate"}]
+        })
+        print("  Added SessionStart hook: myc germinate")
+
+    # Add UserPromptSubmit hook for absorb
+    prompt_hooks = hooks.setdefault("UserPromptSubmit", [])
+    if not _has_myc_hook(prompt_hooks, "myc"):
+        prompt_hooks.append({
+            "hooks": [{"type": "command", "command": "myc absorb"}]
+        })
+        print("  Added UserPromptSubmit hook: myc absorb")
+
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def _setup_claude_instructions():
+    """Append mycelium instructions to ~/.claude/CLAUDE.md if not already present."""
+    claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    claude_md.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = claude_md.read_text() if claude_md.exists() else ""
+    if "mycelium" in existing.lower() or "myc spore" in existing:
+        print("  CLAUDE.md already has mycelium instructions")
+        return
+
+    instructions = """
+## Mycelium (Cross-Instance Messaging)
+
+Claude instances communicate via `myc` — a message bus for AI agents. Messages are push-delivered into your terminal automatically.
+
+**Before sending a message, always check the topology:**
+- Run `myc hyphae` to see all agents and their topic subscriptions
+- Use this to determine which topic connects you to the target agent
+- NEVER guess a topic name — always check first
+
+**Commands:**
+- `myc spore <topic> <message>` — send a message (default: notify)
+- `myc spore <topic> <message> --action prompt` — send and expect a response
+- `myc absorb` — drain queued messages (runs automatically via hook)
+- `myc hyphae` — show all agents and their topics
+- `myc tendrils` — list your subscriptions
+- `myc graft <topic>` — subscribe to a topic
+- `myc sever <topic>` — unsubscribe from a topic
+- `myc colony` — show who's on the network
+
+**When to publish:**
+- You changed an API, schema, or contract that other projects consume
+- You discovered a bug or gotcha that affects a sibling project
+- You need another project to make a complementary change
+"""
+
+    with open(claude_md, "a") as f:
+        f.write(instructions)
+    print("  Added mycelium instructions to ~/.claude/CLAUDE.md")
 
 
 # --- Config command ---
