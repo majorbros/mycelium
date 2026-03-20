@@ -69,7 +69,7 @@ except: pass
 " 2>/dev/null)
 
         if [ -n "$window_id" ]; then
-            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
+            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id/$window_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
             # Pin agent name to this window so it persists across cwd changes
             session_dir="$CONFIG_DIR/sessions"
             mkdir -p "$session_dir"
@@ -96,7 +96,7 @@ done
 if [ -n "$ghostty_pid" ] && command -v aerospace >/dev/null 2>&1; then
     window_id=$(aerospace list-windows --all --format '%{window-id} %{app-pid}' 2>/dev/null | awk -v pid="$ghostty_pid" '$2 == pid {print $1; exit}')
     if [ -n "$window_id" ]; then
-        "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id" -m "$window_id" -r -q 1 2>/dev/null
+        "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id/$window_id" -m "$window_id" -r -q 1 2>/dev/null
     fi
 fi
 

@@ -79,26 +79,31 @@ def load_config():
         return json.loads(cfg_file.read_text())
     return {}
 
-def get_presence(client_id):
-    """Look up retained presence from presence/<client_id>.
-    Returns dict: {'type': 'kitty', 'socket': '...', 'window_id': '...'}
+def get_presences(client_id):
+    """Look up all retained presences from presence/<client_id>/+.
+    Returns list of dicts: [{'type': 'kitty', 'socket': '...', 'window_id': '...'}, ...]
     """
+    results = []
     try:
         result = subprocess.run(
-            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}",
-             "-C", "1", "-W", "1"],
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}/+",
+             "-W", "1", "-v"],
             capture_output=True, text=True, timeout=3
         )
-        val = result.stdout.strip()
-        if not val:
-            return None
-        if val.startswith("kitty:"):
-            parts = val.split(":", 2)
-            if len(parts) == 3:
-                return {"type": "kitty", "socket": parts[1], "window_id": parts[2]}
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) < 2 or not parts[1].strip():
+                continue
+            val = parts[1].strip()
+            if val.startswith("kitty:"):
+                vparts = val.split(":", 2)
+                if len(vparts) == 3:
+                    results.append({"type": "kitty", "socket": vparts[1], "window_id": vparts[2]})
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
-    return None
+    return results
 
 def window_exists_kitty(socket, window_id):
     try:
@@ -252,10 +257,11 @@ def process_message(topic, raw_payload):
 
     subs = load_subs()
     sender_client_id = sender.replace("/", ".")
-    sender_presence = get_presence(sender_client_id)
-    # Fall back to embedded presence from payload (handles name mismatches)
-    if not sender_presence and embedded_presence:
-        sender_presence = embedded_presence
+    # Get sender's presence — try live lookup, fall back to embedded
+    sender_windows = get_presences(sender_client_id)
+    sender_presence = embedded_presence  # from payload, specific window that sent
+    if not sender_presence and sender_windows:
+        sender_presence = sender_windows[0]
 
     targets = []
     for agent, topics in subs.items():
@@ -278,33 +284,33 @@ def process_message(topic, raw_payload):
                 log(f"Rate limited {client_id} on {topic}: {reason}")
                 continue
 
-            presence = get_presence(client_id)
-            if not presence:
+            windows = get_presences(client_id)
+            if not windows:
                 log(f"No presence for {client_id}, skipping push (queued for absorb)")
                 continue
 
-            # Window-level self-echo: skip if sender is in the same window
-            # (catches cases where sender name doesn't match subscription key)
-            if sender_presence and presence.get("type") == "kitty" and sender_presence.get("type") == "kitty":
-                if (presence.get("socket") == sender_presence.get("socket") and
-                        presence.get("window_id") == sender_presence.get("window_id")):
-                    log(f"Skipping {client_id}: same window as sender {sender_client_id}")
-                    continue
+            for presence in windows:
+                # Window-level self-echo: skip if sender is in the same window
+                if sender_presence and presence.get("type") == "kitty" and sender_presence.get("type") == "kitty":
+                    if (presence.get("socket") == sender_presence.get("socket") and
+                            presence.get("window_id") == sender_presence.get("window_id")):
+                        log(f"Skipping {client_id} window {presence.get('window_id')}: same window as sender")
+                        continue
 
-            if presence["type"] == "kitty":
-                sock = presence["socket"]
-                wid = presence["window_id"]
-                if not window_exists_kitty(sock, wid):
-                    log(f"Kitty window {wid} for {client_id} gone, skipping")
-                    continue
-                # Only wait for idle if user is actively typing in this window
-                if is_window_focused(sock, wid):
-                    wait_for_user_idle()
-                log(f"Injecting into {client_id} (kitty:{wid}): {message[:60]}...")
-                try:
-                    inject_kitty(sock, wid, inject_text, action, vim_mode)
-                except Exception as e:
-                    log(f"Injection failed for {client_id}: {e}")
+                if presence["type"] == "kitty":
+                    sock = presence["socket"]
+                    wid = presence["window_id"]
+                    if not window_exists_kitty(sock, wid):
+                        log(f"Kitty window {wid} for {client_id} gone, skipping")
+                        continue
+                    # Only wait for idle if user is actively typing in this window
+                    if is_window_focused(sock, wid):
+                        wait_for_user_idle()
+                    log(f"Injecting into {client_id} (kitty:{wid}): {message[:60]}...")
+                    try:
+                        inject_kitty(sock, wid, inject_text, action, vim_mode)
+                    except Exception as e:
+                        log(f"Injection failed for {client_id} window {wid}: {e}")
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")

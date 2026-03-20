@@ -402,7 +402,9 @@ def status():
 
 
 def _get_all_presences():
-    """Fetch all retained presence messages from the broker."""
+    """Fetch all retained presence messages from the broker.
+    Returns dict: {agent_name: [value1, value2, ...]} — one entry per window.
+    """
     try:
         result = subprocess.run(
             [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", "presence/#", "-W", "2", "-v"],
@@ -417,9 +419,13 @@ def _get_all_presences():
         parts = line.split(" ", 1)
         if len(parts) < 2 or not parts[1].strip():
             continue
-        # presence/agent.name → agent.name
-        agent = parts[0].replace("presence/", "").replace(".", "/", 1)
-        presences[agent] = parts[1].strip()
+        # presence/agent.name/window_id → agent.name
+        # Also handles legacy presence/agent.name (no window_id)
+        topic = parts[0]
+        segments = topic.replace("presence/", "", 1).split("/")
+        client_id = segments[0]  # e.g., integrations.camel
+        agent = client_id.replace(".", "/", 1)
+        presences.setdefault(agent, []).append(parts[1].strip())
     return presences
 
 
@@ -456,11 +462,18 @@ def colony():
         print("  No agents on the network.")
         return
 
-    # Check liveness for all presences
+    # Check liveness for all presences (agent is alive if any window is alive)
     agents = {}
-    for agent, value in presences.items():
-        alive, backend = _check_presence_alive(value)
-        agents[agent] = {"presence": value, "alive": alive, "backend": backend}
+    for agent, values in presences.items():
+        any_alive = False
+        backend = None
+        for value in values:
+            alive, be = _check_presence_alive(value)
+            if alive:
+                any_alive = True
+            backend = be
+        window_count = len(values)
+        agents[agent] = {"presence": values, "alive": any_alive, "backend": backend, "windows": window_count}
 
     # Add agents that have subscriptions but no presence
     for agent in subs:
@@ -477,7 +490,8 @@ def colony():
     for agent in sorted(agents.keys()):
         info = agents[agent]
         if info["alive"]:
-            status_str = "alive"
+            win_count = info.get("windows", 1)
+            status_str = f"alive ({win_count}w)" if win_count > 1 else "alive"
         elif info["presence"]:
             status_str = "stale"
         else:
@@ -499,18 +513,22 @@ def gc():
 
     stale = []
     alive = []
-    for agent, value in presences.items():
-        is_alive, backend = _check_presence_alive(value)
-        if is_alive:
+    for agent, values in presences.items():
+        agent_has_alive = False
+        for value in values:
+            is_alive, backend = _check_presence_alive(value)
+            if is_alive:
+                agent_has_alive = True
+            else:
+                stale.append((agent, value, backend))
+        if agent_has_alive:
             alive.append(agent)
-        else:
-            stale.append((agent, value, backend))
 
     if not stale:
         print(f"  All {len(alive)} presences are alive. Nothing to clean.")
         return
 
-    print(f"\n  Found {len(stale)} stale presence(s):\n")
+    print(f"\n  Found {len(stale)} stale presence window(s):\n")
     for agent, value, backend in stale:
         print(f"    {agent} ({backend}: {value})")
 
@@ -518,12 +536,22 @@ def gc():
 
     for agent, value, backend in stale:
         client_key = agent.replace("/", ".")
+        # Extract window_id from presence value to clear the specific topic
+        wid = None
+        if value.startswith("kitty:"):
+            vparts = value.split(":", 2)
+            if len(vparts) == 3:
+                wid = vparts[2]
+        if wid:
+            topic = f"presence/{client_key}/{wid}"
+        else:
+            topic = f"presence/{client_key}"
         subprocess.run(
             [MOSQUITTO_PUB, "-h", "127.0.0.1",
-             "-t", f"presence/{client_key}", "-m", "", "-r"],
+             "-t", topic, "-m", "", "-r"],
             capture_output=True, text=True
         )
-        print(f"  Cleared presence/{client_key}")
+        print(f"  Cleared {topic}")
 
     # Check for orphaned subscriptions (agents with no presence and no live session)
     subs = load_subs()
@@ -617,13 +645,15 @@ def publish(topic, message, action="notify", depth=0):
     sender_presence = None
     try:
         result = subprocess.run(
-            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}",
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}/+",
              "-C", "1", "-W", "1"],
             capture_output=True, text=True, timeout=3
         )
         val = result.stdout.strip()
-        if val and val.startswith("kitty:"):
-            parts = val.split(":", 2)
+        if val and "kitty:" in val:
+            # Parse "kitty:<socket>:<window_id>" from the message value
+            val_part = val.split(" ", 1)[-1] if " " in val else val
+            parts = val_part.split(":", 2)
             if len(parts) == 3:
                 sender_presence = {"type": "kitty", "socket": parts[1], "window_id": parts[2]}
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -662,9 +692,8 @@ def sporulate(message, action="prompt"):
 
     # Filter to alive agents (include self — other windows of same project should get it too)
     alive = []
-    for agent, value in presences.items():
-        is_alive, _ = _check_presence_alive(value)
-        if is_alive:
+    for agent, values in presences.items():
+        if any(_check_presence_alive(v)[0] for v in values):
             alive.append(agent)
 
     if not alive:
@@ -715,7 +744,7 @@ def dm(target, message, action="prompt"):
         presence = None
         try:
             result = subprocess.run(
-                [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{target_client_id}",
+                [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{target_client_id}/+",
                  "-C", "1", "-W", "1"],
                 capture_output=True, text=True, timeout=3
             )
@@ -862,11 +891,22 @@ def prune(agent_name):
     topics = subs.pop(agent_name)
     save_subs(subs)
 
-    # Clear presence
+    # Clear all presence windows for this agent
     client_id = agent_name.replace("/", ".")
-    subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                    "-t", f"presence/{client_id}", "-m", "", "-r"],
-                   capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{client_id}/+",
+             "-W", "1", "-v"],
+            capture_output=True, text=True, timeout=3
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.strip():
+                ptopic = line.split(" ", 1)[0]
+                subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
+                                "-t", ptopic, "-m", "", "-r"],
+                               capture_output=True, text=True)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
 
     print(f"  Pruned '{agent_name}' — removed {len(topics)} subscription(s): {', '.join(topics)}")
 
@@ -1325,12 +1365,12 @@ def cultivate():
     _register_persistent_sub(name_a.lower(), topic)
     _register_persistent_sub(name_b.lower(), topic)
 
-    # Register presence
+    # Register presence (keyed by window ID)
     subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                    "-t", f"presence/{name_a.lower()}", "-m", f"kitty:{sock}:{wid_a}",
+                    "-t", f"presence/{name_a.lower()}/{wid_a}", "-m", f"kitty:{sock}:{wid_a}",
                     "-r", "-q", "1"], capture_output=True, text=True)
     subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                    "-t", f"presence/{name_b.lower()}", "-m", f"kitty:{sock}:{wid_b}",
+                    "-t", f"presence/{name_b.lower()}/{wid_b}", "-m", f"kitty:{sock}:{wid_b}",
                     "-r", "-q", "1"], capture_output=True, text=True)
 
     # Launch LLM in both windows (set agent name so sender matches subscription key)
@@ -1392,10 +1432,10 @@ def cultivate():
         subs.pop(name_b.lower(), None)
         save_subs(subs)
 
-        # Clear presence
-        for name in [name_a.lower(), name_b.lower()]:
+        # Clear presence (keyed by window ID)
+        for name, wid in [(name_a.lower(), wid_a), (name_b.lower(), wid_b)]:
             subprocess.run([MOSQUITTO_PUB, "-h", "127.0.0.1",
-                            "-t", f"presence/{name}", "-m", "", "-r"],
+                            "-t", f"presence/{name}/{wid}", "-m", "", "-r"],
                            capture_output=True, text=True)
 
         # Wither the petri dish topic
