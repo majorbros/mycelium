@@ -19,6 +19,7 @@ Usage:
   myc init                                               Set up mycelium
   myc config [key] [value]                               Get/set config
   myc cultivate                                          Demo: spawn two agents
+  myc whisper <agent> <message> [--action prompt|notify]   Direct message an agent (auto-creates channel)
   myc germinate                                          Register this session
   myc start                                              Start services
   myc stop                                               Stop services
@@ -26,7 +27,7 @@ Usage:
 Aliases:
   spore=publish  absorb=check  graft=subscribe  sever=unsubscribe
   tendrils=subscriptions  colony=status  cultivate=demo  germinate=register
-  hyphae=routes
+  hyphae=routes  whisper=dm
 """
 
 import sqlite3
@@ -648,6 +649,63 @@ def publish(topic, message, action="notify", depth=0):
     subs = load_subs()
     count = sum(1 for p, topics in subs.items() if topic in topics and p != agent)
     print(f"  Published to '{topic}' ({count} subscriber{'s' if count != 1 else ''})")
+
+
+def dm(target, message, action="prompt"):
+    """Direct message an agent. Auto-creates a 1:1 channel if needed."""
+    sender = get_agent_name()
+    sender_id = get_client_id()
+
+    # Resolve target — find the full agent name from subscriptions/presence
+    subs = load_subs()
+    resolved = None
+    for agent in subs:
+        # Match on last segment (e.g., "popdocs" matches "integrations/popdocs")
+        short = agent.split("/")[-1] if "/" in agent else agent
+        if short.lower() == target.lower() or agent.lower() == target.lower():
+            resolved = agent
+            break
+
+    # If not in subs, check presence
+    if not resolved:
+        target_client_id = target.replace("/", ".")
+        presence = None
+        try:
+            result = subprocess.run(
+                [MOSQUITTO_SUB, "-h", "127.0.0.1", "-t", f"presence/{target_client_id}",
+                 "-C", "1", "-W", "1"],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.stdout.strip():
+                presence = result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        if presence:
+            resolved = target
+        else:
+            print(f"  Can't find agent '{target}'. Run `myc hyphae` to see who's on the network.")
+            return
+
+    # Deterministic DM topic — sorted so both sides get the same name
+    pair = sorted([sender.lower().replace("/", "-"), resolved.lower().replace("/", "-")])
+    topic = f"dm/{pair[0]}/{pair[1]}"
+
+    # Auto-subscribe both agents if not already on this topic
+    changed = False
+    if topic not in subs.get(sender, []):
+        subs.setdefault(sender, []).append(topic)
+        _register_persistent_sub(sender_id, topic)
+        changed = True
+    target_id = resolved.replace("/", ".")
+    if topic not in subs.get(resolved, []):
+        subs.setdefault(resolved, []).append(topic)
+        _register_persistent_sub(target_id, topic)
+        changed = True
+    if changed:
+        save_subs(subs)
+
+    # Publish on the DM topic
+    publish(topic, message, action=action)
 
 
 def check(show_all=False):
@@ -1392,6 +1450,24 @@ def main():
         gc()
     elif cmd == "wither" and len(sys.argv) >= 3:
         wither(sys.argv[2], keep_history="--keep-history" in sys.argv)
+    elif cmd in ("dm", "whisper") and len(sys.argv) >= 4:
+        target = sys.argv[2]
+        args = sys.argv[3:]
+        action = "prompt"
+        msg_parts = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--action" and i + 1 < len(args):
+                action = args[i + 1]
+                i += 2
+            else:
+                msg_parts.append(args[i])
+                i += 1
+        message = " ".join(msg_parts)
+        if not message:
+            print("Usage: myc dm <agent> <message> [--action prompt|notify]")
+            return
+        dm(target, message, action=action)
     else:
         print(__doc__)
 
