@@ -660,15 +660,15 @@ def sporulate(message, action="prompt"):
         print("  No agents on the network.")
         return
 
-    # Filter to alive agents, skip self
+    # Filter to alive agents (include self — other windows of same project should get it too)
     alive = []
     for agent, value in presences.items():
         is_alive, _ = _check_presence_alive(value)
-        if is_alive and agent != sender:
+        if is_alive:
             alive.append(agent)
 
     if not alive:
-        print("  No other alive agents to reach.")
+        print("  No alive agents on the network.")
         return
 
     # Use the broadcast topic — auto-subscribe everyone
