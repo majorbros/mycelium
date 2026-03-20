@@ -159,10 +159,7 @@ def _format_inject(sender, topic, message, action):
 
 def inject_kitty(socket, window_id, text, action, vim_mode=True):
     """Inject via kitty @ send-text with stepped keystrokes."""
-    if action == "notify":
-        full_text = f"/btw {text}"
-    else:
-        full_text = text
+    full_text = text
 
     match_arg = f"id:{window_id}"
     sock_arg = f"unix:{socket}"
