@@ -20,6 +20,7 @@ Usage:
   myc config [key] [value]                               Get/set config
   myc cultivate                                          Demo: spawn two agents
   myc whisper <agent> <message> [--action prompt|notify]   Direct message an agent (auto-creates channel)
+  myc sporulate <message> [--action prompt|notify]        Broadcast to ALL alive agents
   myc germinate                                          Register this session
   myc start                                              Start services
   myc stop                                               Stop services
@@ -649,6 +650,48 @@ def publish(topic, message, action="notify", depth=0):
     subs = load_subs()
     count = sum(1 for p, topics in subs.items() if topic in topics and p != agent)
     print(f"  Published to '{topic}' ({count} subscriber{'s' if count != 1 else ''})")
+
+
+def sporulate(message, action="prompt"):
+    """Broadcast a message to every alive agent on the network."""
+    sender = get_agent_name()
+    presences = _get_all_presences()
+    if not presences:
+        print("  No agents on the network.")
+        return
+
+    # Filter to alive agents, skip self
+    alive = []
+    for agent, value in presences.items():
+        is_alive, _ = _check_presence_alive(value)
+        if is_alive and agent != sender:
+            alive.append(agent)
+
+    if not alive:
+        print("  No other alive agents to reach.")
+        return
+
+    # Use the broadcast topic — auto-subscribe everyone
+    topic = "broadcast"
+    subs = load_subs()
+    changed = False
+    # Subscribe sender
+    if topic not in subs.get(sender, []):
+        subs.setdefault(sender, []).append(topic)
+        _register_persistent_sub(get_client_id(), topic)
+        changed = True
+    # Subscribe all alive agents
+    for agent in alive:
+        if topic not in subs.get(agent, []):
+            subs.setdefault(agent, []).append(topic)
+            agent_client_id = agent.replace("/", ".")
+            _register_persistent_sub(agent_client_id, topic)
+            changed = True
+    if changed:
+        save_subs(subs)
+
+    publish(topic, message, action=action)
+    print(f"  Reached {len(alive)} agent(s): {', '.join(a.split('/')[-1] for a in alive)}")
 
 
 def dm(target, message, action="prompt"):
@@ -1450,6 +1493,23 @@ def main():
         gc()
     elif cmd == "wither" and len(sys.argv) >= 3:
         wither(sys.argv[2], keep_history="--keep-history" in sys.argv)
+    elif cmd in ("sporulate", "broadcast") and len(sys.argv) >= 3:
+        args = sys.argv[2:]
+        action = "prompt"
+        msg_parts = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--action" and i + 1 < len(args):
+                action = args[i + 1]
+                i += 2
+            else:
+                msg_parts.append(args[i])
+                i += 1
+        message = " ".join(msg_parts)
+        if not message:
+            print("Usage: myc sporulate <message> [--action prompt|notify]")
+            return
+        sporulate(message, action=action)
     elif cmd in ("dm", "whisper") and len(sys.argv) >= 4:
         target = sys.argv[2]
         args = sys.argv[3:]
