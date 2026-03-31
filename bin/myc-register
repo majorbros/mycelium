@@ -6,11 +6,20 @@ MOSQUITTO_PUB=$(command -v mosquitto_pub 2>/dev/null || echo "/opt/homebrew/bin/
 KITTY=$(command -v kitty 2>/dev/null || echo "/opt/homebrew/bin/kitty")
 CONFIG_DIR="$HOME/.mycelium"
 
+# Quiet mode: skip registration so this window does not receive messages
+if [ "${MYC_QUIET:-}" = "1" ]; then
+  exit 0
+fi
+
 # Load agent name from config or derive from cwd
 if [ -f "$CONFIG_DIR/config.json" ]; then
     agent_name=$(python3 -c "import json; print(json.load(open('$CONFIG_DIR/config.json')).get('agent_name',''))" 2>/dev/null)
 fi
 
+# Per-project override: check for .mycelium.json in cwd
+if [ -z "$agent_name" ] && [ -f "$PWD/.mycelium.json" ]; then
+    agent_name=$(python3 -c "import json; print(json.load(open('$PWD/.mycelium.json')).get('agent_name',''))" 2>/dev/null)
+fi
 if [ -z "$agent_name" ]; then
     cwd="$PWD"
     project=$(basename "$cwd")
@@ -69,7 +78,13 @@ except: pass
 " 2>/dev/null)
 
         if [ -n "$window_id" ]; then
-            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id/$window_id" -m "kitty:${kitty_sock}:${window_id}" -r -q 1 2>/dev/null
+            # Clear any stale presence from other agents on this same socket:window
+            presence_value="kitty:${kitty_sock}:${window_id}"
+            stale=$("$MOSQUITTO_SUB" -h 127.0.0.1 -t "presence/#" -W 1 -v 2>/dev/null |               grep "$presence_value" | grep -v "^presence/$client_id/" | awk '{print $1}')
+            for stale_topic in $stale; do
+              "$MOSQUITTO_PUB" -h 127.0.0.1 -t "$stale_topic" -r -n 2>/dev/null
+            done
+            "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id/$window_id" -m "$presence_value" -r -q 1 2>/dev/null
             # Pin agent name to this window so it persists across cwd changes
             session_dir="$CONFIG_DIR/sessions"
             mkdir -p "$session_dir"

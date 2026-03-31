@@ -190,6 +190,18 @@ def get_agent_name():
     session_name = _get_session_agent_name()
     if session_name:
         return session_name
+    # Per-project override: .mycelium.json in cwd or parent dirs
+    cwd = Path(os.getcwd())
+    for d in [cwd, *cwd.parents]:
+        proj_cfg = d / ".mycelium.json"
+        if proj_cfg.exists():
+            try:
+                pname = json.loads(proj_cfg.read_text()).get("agent_name", "")
+                if pname:
+                    return pname
+            except Exception:
+                pass
+            break
     cfg = load_config()
     name = cfg.get("agent_name", "")
     if name:
@@ -995,12 +1007,21 @@ def detect_llm():
 def check_kitty():
     """Check if Kitty is installed and remote control is configured."""
     if not shutil.which("kitty"):
-        print("  Kitty terminal not found. Install it:")
-        if sys.platform == "darwin":
-            print("    brew install --cask kitty")
+        if sys.platform == "darwin" and shutil.which("brew"):
+            print("  Kitty terminal not found. Installing...")
+            r = subprocess.run(["brew", "install", "--cask", "kitty"], capture_output=False)
+            if r.returncode != 0 or not shutil.which("kitty"):
+                print("  Failed to install Kitty. Install manually:")
+                print("    brew install --cask kitty")
+                return False
+            print("  Kitty installed.")
         else:
-            print("    https://sw.kovidgoyal.net/kitty/binary/")
-        return False
+            print("  Kitty terminal not found. Install it:")
+            if sys.platform == "darwin":
+                print("    brew install --cask kitty")
+            else:
+                print("    https://sw.kovidgoyal.net/kitty/binary/")
+            return False
 
     kitty_conf = Path.home() / ".config" / "kitty" / "kitty.conf"
     needs_config = True
