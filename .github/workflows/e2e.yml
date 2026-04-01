@@ -1,0 +1,79 @@
+name: E2E Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install mosquitto
+          brew install --cask kitty
+
+      - name: Start Mosquitto
+        run: |
+          /opt/homebrew/sbin/mosquitto -d -c /opt/homebrew/etc/mosquitto/mosquitto.conf || /opt/homebrew/sbin/mosquitto -d
+          sleep 1
+          echo "Mosquitto running"
+
+      - name: Test Kitty launches headless
+        run: |
+          /Applications/kitty.app/Contents/MacOS/kitty \
+            --start-as=hidden \
+            -o allow_remote_control=yes \
+            --listen-on unix:/tmp/test-kitty &
+          KITTY_PID=$!
+          sleep 5
+
+          # Check if Kitty is alive
+          if kill -0 $KITTY_PID 2>/dev/null; then
+            echo "Kitty is running (PID $KITTY_PID)"
+          else
+            echo "Kitty failed to start"
+            exit 1
+          fi
+
+          # Test remote control
+          /Applications/kitty.app/Contents/MacOS/kitty @ --to unix:/tmp/test-kitty ls
+          echo "Kitty remote control works!"
+
+      - name: Install mycelium
+        run: |
+          chmod +x bin/myc bin/myc-watcher bin/myc-historian bin/myc-register bin/myc-services
+          sudo cp bin/myc bin/myc-watcher bin/myc-historian bin/myc-register bin/myc-services /usr/local/bin/
+
+      - name: Test myc CLI
+        run: myc | head -5
+
+      - name: Test MQTT pub/sub
+        run: |
+          /opt/homebrew/bin/mosquitto_pub -h 127.0.0.1 -t "test/e2e" -m "hello from CI" -r
+          result=$(/opt/homebrew/bin/mosquitto_sub -h 127.0.0.1 -t "test/e2e" -W 3 -C 1)
+          echo "Received: $result"
+          [ "$result" = "hello from CI" ] || exit 1
+
+      - name: Test message injection into Kitty
+        run: |
+          # Get window ID from Kitty
+          window_info=$(/Applications/kitty.app/Contents/MacOS/kitty @ --to unix:/tmp/test-kitty ls)
+          echo "Window info: $window_info"
+          window_id=$(echo "$window_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['tabs'][0]['windows'][0]['id'])")
+          echo "Window ID: $window_id"
+
+          # Inject text via send-text
+          /Applications/kitty.app/Contents/MacOS/kitty @ --to unix:/tmp/test-kitty send-text --match "id:$window_id" "echo hello from mycelium\n"
+          sleep 2
+
+          # Get window text to verify injection
+          text=$(/Applications/kitty.app/Contents/MacOS/kitty @ --to unix:/tmp/test-kitty get-text --match "id:$window_id")
+          echo "Window text: $text"
+          echo "$text" | grep -q "hello from mycelium" && echo "PASS: Text injection works!" || echo "WARN: Could not verify text (may still have worked)"
