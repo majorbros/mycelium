@@ -110,6 +110,12 @@ MUSHROOMS = [
     "Porcini", "Oyster", "Matsutake", "Maitake", "Cremini", "Reishi"
 ]
 
+MUSHROOM_COLORS = {
+    "Shiitake": 214, "Portobello": 175, "Chanterelle": 220, "Morel": 108,
+    "Enoki": 195, "Truffle": 139, "Porcini": 180, "Oyster": 117,
+    "Matsutake": 210, "Maitake": 156, "Cremini": 181, "Reishi": 167,
+}
+
 ALIASES = {
     "spore": "publish",
     "absorb": "check",
@@ -300,6 +306,21 @@ def _brew_service_stop(name):
     return result.returncode == 0
 
 
+def _ensure_observe_ui():
+    """Start the local web UI (observe_serve) when ~/.mycelium/scripts/ensure_observe.sh exists."""
+    script = CONFIG_DIR / "scripts" / "ensure_observe.sh"
+    if not script.is_file():
+        return
+    try:
+        subprocess.run(
+            ["/bin/bash", str(script)],
+            env=os.environ,
+            timeout=25,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+
 def start():
     bp = broker_pid()
     hp = historian_pid()
@@ -307,6 +328,7 @@ def start():
 
     if bp and hp and wp:
         print(f"  All services running — broker:{bp} historian:{hp} watcher:{wp}")
+        _ensure_observe_ui()
         return
 
     use_brew = _is_brew_formula("mycelium")
@@ -331,6 +353,7 @@ def start():
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 print(f"  Failed to start broker: {proc.stderr.strip()}", file=sys.stderr)
+                _ensure_observe_ui()
                 return
             time.sleep(0.5)
             bp = _check_pid(BROKER_PID, "mosquitto")
@@ -382,6 +405,8 @@ def start():
         client_id = agent.replace("/", ".")
         for topic in topics:
             _register_persistent_sub(client_id, topic)
+
+    _ensure_observe_ui()
 
 
 def stop():
@@ -1485,20 +1510,58 @@ def startup_screen():
         cols = 80
 
     box_w = min(cols, 90)
+
+    # Shared state (fast only — no network calls)
+    agent = get_agent_name()
+    bp = broker_pid()
+    hp = historian_pid()
+    wp = watcher_pid()
+    try:
+        observe_port = int(os.environ.get("MYCELIUM_OBSERVE_PORT", "8765"))
+    except ValueError:
+        observe_port = 8765
+    ui_base = f"http://127.0.0.1:{observe_port}"
+
+    # Narrow terminals (split panes, small windows) — keep art + Web UI, not the full help dump
     if box_w < 60:
-        print(__doc__)
+        if use_color:
+            R = "\033[0m"
+            B = "\033[1m"
+            CAP = "\033[38;5;167m"
+            STEM = "\033[38;5;180m"
+            TTL = "\033[38;5;216m"
+            LBL = "\033[38;5;109m"
+            GRN = "\033[38;5;108m"
+            VAL = "\033[38;5;252m"
+            MUT = "\033[38;5;245m"
+            AGT = "\033[38;5;180m"
+        else:
+            R = B = CAP = STEM = TTL = LBL = GRN = VAL = MUT = AGT = ""
+        print(f"\n{TTL}{B} 🍄 Mycelium{R}  {MUT}Welcome to the underground!{R}\n")
+        for line in (
+            f"    {CAP}▄████▄{R}",
+            f"   {CAP}████████{R}",
+            f"    {STEM}████{R}",
+        ):
+            print(line)
+        print(f"\n{MUT}Agent:{R} {AGT}{agent}{R}")
+        print(f"\n{LBL}{B}Web UI{R}")
+        print(f"{VAL}{ui_base}/ui/{R}")
+        print(f"{MUT}Observe{R} · {ui_base}/ui/observe.html")
+        print(f"{MUT}Lab{R} · {ui_base}/ui/growth.html")
+        svc_bits = []
+        for name, pid in [("broker", bp), ("historian", hp), ("watcher", wp)]:
+            dot = f"{GRN}●{R}" if pid else f"{MUT}○{R}"
+            lbl = f"{VAL}{name}{R}" if pid else f"{MUT}{name}{R}"
+            svc_bits.append(f"{dot} {lbl}")
+        print(f"\n{LBL}{B}Services{R}  " + "  ".join(svc_bits))
+        print(f"\n{MUT}myc help{R} — full command list\n")
         return
 
     inner_w = box_w - 4
     left_w = 34
     gap = 2
     right_w = inner_w - left_w - gap
-
-    # Gather info (fast only — no network calls)
-    agent = get_agent_name()
-    bp = broker_pid()
-    hp = historian_pid()
-    wp = watcher_pid()
 
     subs = load_subs()
     my_topics = subs.get(agent, [])
@@ -1575,6 +1638,11 @@ def startup_screen():
     right.append(f"{VAL}myc absorb{R}")
     right.append(f"{VAL}myc colony{R}")
     right.append(f"{VAL}myc hyphae{R}")
+    right.append("")
+    right.append(f"{LBL}{B}Web UI{R}")
+    right.append(f"{VAL}{ui_base}/ui/{R}")
+    right.append(f"{MUT}observe · {ui_base}/ui/observe.html{R}")
+    right.append(f"{MUT}Lab · {ui_base}/ui/growth.html{R}")
     right.append("")
     right.append(f"{LBL}{B}Services{R}")
 
