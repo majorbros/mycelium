@@ -31,6 +31,7 @@ Aliases:
   hyphae=routes  whisper=dm
 """
 
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1472,14 +1473,165 @@ def cultivate():
         print("  Done.\n")
 
 
+# --- Startup Screen ---
+
+def startup_screen():
+    """Show mushroom-themed startup screen."""
+    use_color = sys.stdout.isatty()
+
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+
+    box_w = min(cols, 90)
+    if box_w < 60:
+        print(__doc__)
+        return
+
+    inner_w = box_w - 4
+    left_w = 34
+    gap = 2
+    right_w = inner_w - left_w - gap
+
+    # Gather info (fast only — no network calls)
+    agent = get_agent_name()
+    bp = broker_pid()
+    hp = historian_pid()
+    wp = watcher_pid()
+
+    subs = load_subs()
+    my_topics = subs.get(agent, [])
+
+    recent = []
+    if HISTORIAN_DB.exists():
+        try:
+            db = sqlite3.connect(str(HISTORIAN_DB))
+            recent = db.execute(
+                "SELECT sender, topic, message, timestamp "
+                "FROM messages ORDER BY id DESC LIMIT 3"
+            ).fetchall()
+            db.close()
+        except Exception:
+            pass
+
+    # Colors
+    if use_color:
+        R    = "\033[0m"
+        B    = "\033[1m"
+        CAP  = "\033[38;5;167m"
+        SPOT = "\033[38;5;223m"
+        STEM = "\033[38;5;180m"
+        BOR  = "\033[38;5;240m"
+        TTL  = "\033[38;5;216m"
+        LBL  = "\033[38;5;109m"
+        GRN  = "\033[38;5;108m"
+        VAL  = "\033[38;5;252m"
+        MUT  = "\033[38;5;245m"
+        AGT  = "\033[38;5;180m"
+    else:
+        R = B = CAP = SPOT = STEM = BOR = TTL = ""
+        LBL = GRN = VAL = MUT = AGT = ""
+
+    def vlen(s):
+        return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+    def pad(s, w):
+        return s + " " * max(0, w - vlen(s))
+
+    # Mushroom art
+    shroom = [
+        f"        {CAP}▄████▄{R}",
+        f"      {CAP}▄████████▄{R}",
+        f"     {CAP}██{SPOT}██{CAP}████{SPOT}██{CAP}██{R}",
+        f"     {CAP}████████████{R}",
+        f"      {CAP}▀████████▀{R}",
+        f"         {STEM}████{R}",
+        f"        {STEM}██████{R}",
+        f"         {STEM}▀▀▀▀{R}",
+    ]
+
+    # Left column
+    left = [""]
+    left.append(f"   {B}{VAL}Welcome to the underground!{R}")
+    left.append("")
+    for line in shroom:
+        left.append(f" {line}")
+    left.append("")
+    left.append(f"   {MUT}Agent:{R}  {AGT}{agent}{R}")
+    if my_topics:
+        tstr = ", ".join(my_topics[:3])
+        if len(my_topics) > 3:
+            tstr += f" +{len(my_topics) - 3}"
+        left.append(f"   {MUT}Topics:{R} {VAL}{tstr}{R}")
+    else:
+        left.append(f"   {MUT}Topics:{R} {MUT}none{R}")
+    left.append("")
+
+    # Right column
+    right = [""]
+    right.append(f"{LBL}{B}Quick commands{R}")
+    right.append(f"{VAL}myc spore {MUT}<topic> <msg>{R}")
+    right.append(f"{VAL}myc absorb{R}")
+    right.append(f"{VAL}myc colony{R}")
+    right.append(f"{VAL}myc hyphae{R}")
+    right.append("")
+    right.append(f"{LBL}{B}Services{R}")
+
+    svc_parts = []
+    for name, pid in [("broker", bp), ("historian", hp), ("watcher", wp)]:
+        dot = f"{GRN}●{R}" if pid else f"{MUT}○{R}"
+        lbl = f"{VAL}{name}{R}" if pid else f"{MUT}{name}{R}"
+        svc_parts.append(f"{dot} {lbl}")
+    right.append("  ".join(svc_parts))
+    right.append("")
+
+    right.append(f"{LBL}{B}Recent spores{R}")
+    if recent:
+        for sender, topic, message, ts in recent:
+            dt = datetime.fromtimestamp(ts).strftime("%H:%M")
+            # Truncate message to fit right column
+            prefix_len = 10 + len(sender)  # [HH:MM] sender:
+            max_msg = right_w - prefix_len - 1
+            if max_msg < 5:
+                max_msg = 5
+            ms = (message[:max_msg] + "…") if len(message) > max_msg else message
+            right.append(f"{MUT}[{dt}]{R} {VAL}{sender}{MUT}:{R} {VAL}{ms}{R}")
+    else:
+        right.append(f"{MUT}No recent spores{R}")
+    right.append("")
+
+    # Equalize heights
+    max_h = max(len(left), len(right))
+    left  += [""] * (max_h - len(left))
+    right += [""] * (max_h - len(right))
+
+    # Render
+    title = " 🍄 Mycelium "
+    title_cols = len(title) + 1  # emoji occupies 2 terminal columns
+    dashes = box_w - 3 - title_cols
+    print(f"\n{BOR}╭─{R}{TTL}{B}{title}{R}{BOR}{'─' * dashes}╮{R}")
+
+    for i in range(max_h):
+        l = pad(left[i], left_w)
+        r = pad(right[i], right_w)
+        print(f"{BOR}│{R} {l}{' ' * gap}{r} {BOR}│{R}")
+
+    print(f"{BOR}╰{'─' * (box_w - 2)}╯{R}")
+    print()
+
+
 # --- Main ---
 
 def main():
     if len(sys.argv) < 2:
-        print(__doc__)
+        startup_screen()
         return
 
     cmd = sys.argv[1]
+    if cmd in ("help", "--help", "-h"):
+        print(__doc__)
+        return
     cmd = ALIASES.get(cmd, cmd)
 
     if cmd == "publish" and len(sys.argv) >= 4:
