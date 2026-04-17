@@ -4,7 +4,7 @@ Mycelium — the underground network for AI agents.
 LLM-agnostic message bus with transparent terminal visibility.
 
 Usage:
-  myc spore <topic> <message> [--action prompt|notify]   Publish a spore (message)
+  myc spore <topic> <message> [--data '{...}'] [--data-file path]   Publish a spore
   myc absorb [--all]                                     Drain queued messages
   myc graft <topic>                                      Subscribe to a topic
   myc sever <topic> [--agent <name>]                      Unsubscribe from a topic
@@ -19,8 +19,8 @@ Usage:
   myc init                                               Set up mycelium
   myc config [key] [value]                               Get/set config
   myc cultivate                                          Demo: spawn two agents
-  myc whisper <agent> <message> [--action prompt|notify]   Direct message an agent (auto-creates channel)
-  myc sporulate <message> [--action prompt|notify]        Broadcast to ALL alive agents
+  myc whisper <agent> <message> [--data '{...}'] [--data-file path]   Direct message
+  myc sporulate <message> [--data '{...}'] [--data-file path]        Broadcast to all
   myc germinate                                          Register this session
   myc start                                              Start services
   myc stop                                               Stop services
@@ -42,6 +42,7 @@ import signal
 import shutil
 import glob
 import random
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -55,6 +56,7 @@ HISTORIAN_PID = CONFIG_DIR / "historian.pid"
 WATCHER_PID = CONFIG_DIR / "watcher.pid"
 BROKER_PID = CONFIG_DIR / "broker.pid"
 WATCHER_LOG = CONFIG_DIR / "watcher.log"
+PAYLOADS_DIR = CONFIG_DIR / "payloads"
 
 # Detect binaries at runtime
 def find_bin(name, fallbacks=None):
@@ -675,7 +677,7 @@ def _register_persistent_sub(client_id, topic):
         pass
 
 
-def publish(topic, message, action="notify", depth=0):
+def publish(topic, message, action="notify", depth=0, data=None, data_file=None):
     agent = get_agent_name()
     client_id = get_client_id()
     # Embed sender's presence so the watcher can do window-level echo detection
@@ -696,6 +698,29 @@ def publish(topic, message, action="notify", depth=0):
                 sender_presence = {"type": "kitty", "socket": parts[1], "window_id": parts[2]}
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+
+    # Handle structured data payload
+    ref = None
+    if data or data_file:
+        PAYLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        ref = str(uuid.uuid4())
+        payload_path = PAYLOADS_DIR / f"{ref}.json"
+        if data_file:
+            src = Path(data_file).expanduser()
+            if not src.exists():
+                print(f"  Data file not found: {data_file}", file=sys.stderr)
+                return
+            shutil.copy2(str(src), str(payload_path))
+        else:
+            # Validate JSON
+            try:
+                parsed = json.loads(data) if isinstance(data, str) else data
+            except json.JSONDecodeError as e:
+                print(f"  Invalid JSON data: {e}", file=sys.stderr)
+                return
+            payload_path.write_text(json.dumps(parsed, indent=2))
+        print(f"  Payload written: {payload_path}")
+
     msg = {
         "sender": agent,
         "message": message,
@@ -703,6 +728,8 @@ def publish(topic, message, action="notify", depth=0):
         "action": action,
         "depth": depth
     }
+    if ref:
+        msg["ref"] = ref
     if sender_presence:
         msg["sender_presence"] = sender_presence
     payload = json.dumps(msg)
@@ -720,7 +747,7 @@ def publish(topic, message, action="notify", depth=0):
     print(f"  Published to '{topic}' ({count} subscriber{'s' if count != 1 else ''})")
 
 
-def sporulate(message, action="prompt"):
+def sporulate(message, action="prompt", data=None, data_file=None):
     """Broadcast a message to every alive agent on the network."""
     sender = get_agent_name()
     presences = _get_all_presences()
@@ -757,11 +784,11 @@ def sporulate(message, action="prompt"):
     if changed:
         save_subs(subs)
 
-    publish(topic, message, action=action)
+    publish(topic, message, action=action, data=data, data_file=data_file)
     print(f"  Reached {len(alive)} agent(s): {', '.join(a.split('/')[-1] for a in alive)}")
 
 
-def dm(target, message, action="prompt"):
+def dm(target, message, action="prompt", data=None, data_file=None):
     """Direct message an agent. Auto-creates a 1:1 channel if needed."""
     sender = get_agent_name()
     sender_id = get_client_id()
@@ -815,7 +842,7 @@ def dm(target, message, action="prompt"):
         save_subs(subs)
 
     # Publish on the DM topic
-    publish(topic, message, action=action)
+    publish(topic, message, action=action, data=data, data_file=data_file)
 
 
 def check(show_all=False):
@@ -1708,6 +1735,8 @@ def main():
         args = sys.argv[3:]
         action = "notify"
         depth = 0
+        data = None
+        data_file = None
         msg_parts = []
         i = 0
         while i < len(args):
@@ -1717,14 +1746,20 @@ def main():
             elif args[i] == "--depth" and i + 1 < len(args):
                 depth = int(args[i + 1])
                 i += 2
+            elif args[i] == "--data" and i + 1 < len(args):
+                data = args[i + 1]
+                i += 2
+            elif args[i] == "--data-file" and i + 1 < len(args):
+                data_file = args[i + 1]
+                i += 2
             else:
                 msg_parts.append(args[i])
                 i += 1
         message = " ".join(msg_parts)
         if not message:
-            print("Usage: myc spore <topic> <message> [--action prompt|notify]")
+            print("Usage: myc spore <topic> <message> [--action prompt|notify] [--data '{...}'] [--data-file path]")
             return
-        publish(topic, message, action=action, depth=depth)
+        publish(topic, message, action=action, depth=depth, data=data, data_file=data_file)
     elif cmd == "check":
         check(show_all="--all" in sys.argv)
     elif cmd == "subscribe" and len(sys.argv) >= 3:
@@ -1777,38 +1812,54 @@ def main():
     elif cmd in ("sporulate", "broadcast") and len(sys.argv) >= 3:
         args = sys.argv[2:]
         action = "prompt"
+        data = None
+        data_file = None
         msg_parts = []
         i = 0
         while i < len(args):
             if args[i] == "--action" and i + 1 < len(args):
                 action = args[i + 1]
                 i += 2
+            elif args[i] == "--data" and i + 1 < len(args):
+                data = args[i + 1]
+                i += 2
+            elif args[i] == "--data-file" and i + 1 < len(args):
+                data_file = args[i + 1]
+                i += 2
             else:
                 msg_parts.append(args[i])
                 i += 1
         message = " ".join(msg_parts)
         if not message:
-            print("Usage: myc sporulate <message> [--action prompt|notify]")
+            print("Usage: myc sporulate <message> [--action prompt|notify] [--data '{...}'] [--data-file path]")
             return
-        sporulate(message, action=action)
+        sporulate(message, action=action, data=data, data_file=data_file)
     elif cmd in ("dm", "whisper") and len(sys.argv) >= 4:
         target = sys.argv[2]
         args = sys.argv[3:]
         action = "prompt"
+        data = None
+        data_file = None
         msg_parts = []
         i = 0
         while i < len(args):
             if args[i] == "--action" and i + 1 < len(args):
                 action = args[i + 1]
                 i += 2
+            elif args[i] == "--data" and i + 1 < len(args):
+                data = args[i + 1]
+                i += 2
+            elif args[i] == "--data-file" and i + 1 < len(args):
+                data_file = args[i + 1]
+                i += 2
             else:
                 msg_parts.append(args[i])
                 i += 1
         message = " ".join(msg_parts)
         if not message:
-            print("Usage: myc dm <agent> <message> [--action prompt|notify]")
+            print("Usage: myc whisper <agent> <message> [--action prompt|notify] [--data '{...}'] [--data-file path]")
             return
-        dm(target, message, action=action)
+        dm(target, message, action=action, data=data, data_file=data_file)
     else:
         print(__doc__)
 

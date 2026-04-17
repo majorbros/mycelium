@@ -154,12 +154,16 @@ def wait_for_user_idle():
         pass
 
 
-def _format_inject(sender, topic, message, action):
+def _format_inject(sender, topic, message, action, ref=None):
     """Format a message for injection — single line, visually distinct."""
     # Extract short name (last part of sender path)
     short_name = sender.split("/")[-1] if "/" in sender else sender
     # Box-drawing brackets make it pop against regular text
-    return f"━━ {short_name} ━━ {message}"
+    text = f"━━ {short_name} ━━ {message}"
+    if ref:
+        payloads_dir = Path.home() / ".mycelium" / "payloads"
+        text += f" (+data: {payloads_dir}/{ref}.json)"
+    return text
 
 
 def inject_kitty(socket, window_id, text, action, vim_mode=True):
@@ -237,12 +241,14 @@ def process_message(topic, raw_payload):
         message = payload.get("message", raw_payload)
         action = payload.get("action", "notify")
         depth = payload.get("depth", 0)
+        ref = payload.get("ref")
         embedded_presence = payload.get("sender_presence")
     except (json.JSONDecodeError, AttributeError):
         sender = "unknown"
         message = raw_payload
         action = "notify"
         depth = 0
+        ref = None
         embedded_presence = None
 
     if depth > 0:
@@ -275,7 +281,7 @@ def process_message(topic, raw_payload):
         return
 
     # Format the injected message with visual structure
-    inject_text = _format_inject(sender, topic, message, action)
+    inject_text = _format_inject(sender, topic, message, action, ref=ref)
 
     with _inject_lock:
         for agent, client_id in targets:
