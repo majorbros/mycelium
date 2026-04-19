@@ -457,6 +457,8 @@
 
   // --------- Loop ----------
 
+  let visible = true;
+
   function tick(now) {
     const growInterval = nodes.length < 18 ? 200 : nodes.length < 45 ? 500 : 1200;
     if (now - lastGrow > growInterval) { grow(); lastGrow = now; }
@@ -465,22 +467,39 @@
 
     if (now - lastSpore > 700 + Math.random() * 900) { dropSpore(); lastSpore = now; }
 
-    draw(now);
+    if (visible) draw(now);
     requestAnimationFrame(tick);
+  }
+
+  // Fade canvas out as the hero scrolls off — keep illustration out of body text.
+  function updateVisibility() {
+    const hero = document.querySelector('.hero');
+    if (!hero) return;
+    const heroBottom = hero.offsetTop + hero.offsetHeight;
+    const y = window.scrollY || window.pageYOffset || 0;
+    const fadeStart = heroBottom * 0.55;
+    const fadeEnd = heroBottom;
+    let op = 0.75;
+    if (y >= fadeEnd) op = 0;
+    else if (y > fadeStart) op = 0.75 * (1 - (y - fadeStart) / (fadeEnd - fadeStart));
+    canvas.style.opacity = op.toFixed(3);
+    visible = op > 0.01;
   }
 
   function init() {
     resize();
     seed();
     for (let i = 0; i < 12; i++) grow();
+    updateVisibility();
     requestAnimationFrame(tick);
   }
 
   let resizeTimer;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => { resize(); seed(); for (let i = 0; i < 12; i++) grow(); }, 200);
+    resizeTimer = setTimeout(() => { resize(); seed(); for (let i = 0; i < 12; i++) grow(); updateVisibility(); }, 200);
   });
+  window.addEventListener('scroll', updateVisibility, { passive: true });
 
   init();
 })();

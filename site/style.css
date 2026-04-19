@@ -478,22 +478,26 @@ em { font-style: italic; color: var(--text-soft); }
   border-bottom: 1px dashed var(--border);
 }
 
-.specimen-latin {
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 22px;
-  font-weight: 400;
+.specimen-name {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 500;
   color: var(--accent);
   letter-spacing: -0.01em;
-  font-variation-settings: 'opsz' 48, 'SOFT' 80;
 }
 
-.specimen-common {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
+.specimen-name::before {
+  content: "myc ";
   color: var(--text-dim);
-  text-transform: uppercase;
+  font-weight: 400;
+}
+
+.specimen-role {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 14px;
+  color: var(--text-dim);
+  font-variation-settings: 'opsz' 24, 'SOFT' 50;
 }
 
 .specimen-def {
