@@ -11,8 +11,14 @@ if [ "${MYC_QUIET:-}" = "1" ]; then
   exit 0
 fi
 
+# Explicit per-window identity override (set by the `cx` launcher). Highest
+# priority — lets additional claude windows in one project register as distinct
+# agents (e.g. helm-review) so siblings can address each other. Mirrors the
+# Python `myc`'s get_agent_name(), which already honors MYC_AGENT_NAME first.
+agent_name="${MYC_AGENT_NAME:-}"
+
 # Load agent name from config or derive from cwd
-if [ -f "$CONFIG_DIR/config.json" ]; then
+if [ -z "$agent_name" ] && [ -f "$CONFIG_DIR/config.json" ]; then
     agent_name=$(python3 -c "import json; print(json.load(open('$CONFIG_DIR/config.json')).get('agent_name',''))" 2>/dev/null)
 fi
 
