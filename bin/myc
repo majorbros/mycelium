@@ -183,9 +183,33 @@ def _get_session_agent_name():
     # Check session files for this kitty socket
     sock_name = f"kitty-socket-{kitty_pid}"
     for session_file in session_dir.iterdir():
-        if session_file.name.startswith(sock_name + ":"):
-            _session_name_cache = session_file.read_text().strip()
-            return _session_name_cache
+        if not session_file.name.startswith(sock_name + ":"):
+            continue
+        try:
+            lines = session_file.read_text().splitlines()
+        except Exception:
+            return None
+        if not lines or not lines[0].strip():
+            return None
+        pinned_name = lines[0].strip()
+        pinned_cwd = lines[1].strip() if len(lines) > 1 else ""
+        # A pin is only valid for the directory tree it was created in.
+        # Terminal windows get reused across projects — without this check a
+        # window that once ran `helm` keeps identifying as helm after you cd
+        # into another repo, re-registers presence/helm, and silently steals
+        # that agent's messages. Legacy pins (no cwd recorded) are ignored so
+        # they self-heal on the next registration.
+        if not pinned_cwd:
+            return None
+        try:
+            here = Path(os.getcwd()).resolve()
+            pinned = Path(pinned_cwd).resolve()
+        except Exception:
+            return None
+        if here != pinned and pinned not in here.parents:
+            return None
+        _session_name_cache = pinned_name
+        return _session_name_cache
     return None
 
 

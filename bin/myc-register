@@ -92,9 +92,13 @@ except: pass
             done
             "$MOSQUITTO_PUB" -h 127.0.0.1 -t "presence/$client_id/$window_id" -m "$presence_value" -r -q 1 2>/dev/null
             # Pin agent name to this window so it persists across cwd changes
+            # *within the same project*. Line 2 records the cwd the pin was
+            # created for; myc ignores the pin once the window moves to an
+            # unrelated directory, otherwise a reused window keeps answering
+            # to the previous project's agent name and steals its messages.
             session_dir="$CONFIG_DIR/sessions"
             mkdir -p "$session_dir"
-            echo "$agent_name" > "$session_dir/${kitty_sock##*/}:${window_id}"
+            printf '%s\n%s\n' "$agent_name" "$PWD" > "$session_dir/${kitty_sock##*/}:${window_id}"
             exit 0
         fi
     fi

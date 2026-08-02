@@ -121,6 +121,145 @@ def window_exists_kitty(socket, window_id):
         pass
     return False
 
+def detect_window_llm(socket, window_id):
+    """Identify the LLM CLI running in a kitty window via foreground process
+    cmdlines. Returns 'gemini', 'claude', 'codex', or None.
+
+    Why: gemini-cli and codex interpret ESC as 'cancel current request' and
+    abort any in-flight tool call. The vim-mode injection path leads with ESC,
+    so delivering a spore mid-tool-call kills the run. Claude's vim editor mode
+    tolerates the ESC; the others do not. Caller uses this to disable vim_mode
+    for gemini/codex windows.
+    """
+    try:
+        result = subprocess.run(
+            [KITTY, "@", "--to", f"unix:{socket}", "ls"],
+            capture_output=True, text=True, timeout=3
+        )
+        data = json.loads(result.stdout)
+        for os_win in data:
+            for tab in os_win.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if str(win["id"]) != str(window_id):
+                        continue
+                    for proc in win.get("foreground_processes", []):
+                        for arg in proc.get("cmdline", []):
+                            base = arg.rsplit("/", 1)[-1]
+                            if base == "gemini":
+                                return "gemini"
+                            if base == "claude":
+                                return "claude"
+                            # npm wrapper is codex.js; native binary is codex
+                            if base == "codex" or base.startswith("codex.js") or base.startswith("codex-"):
+                                return "codex"
+    except Exception:
+        pass
+    return None
+
+def _config_name(path):
+    """agent_name from a .mycelium.json at `path`, or None."""
+    cfg = path / ".mycelium.json"
+    if not cfg.exists():
+        return None
+    try:
+        name = json.loads(cfg.read_text()).get("agent_name", "")
+        return name.replace("/", ".") if name else None
+    except Exception:
+        return None
+
+
+def _derive_agent_from_cwd(cwd):
+    """All plausible client_ids for an agent running in `cwd`.
+
+    Returns a set, because the two things that create identities disagree:
+    `myc-register` reads .mycelium.json only in the exact cwd, while `myc`
+    (and `cx`) walk up to parents. A window under ~/majorbros/babylon is
+    therefore 'majorbros.babylon' to one and 'helm' to the other. Accepting
+    both keeps the delivery guard conservative — it only ever rejects when
+    *no* reading of the directory could produce that agent name.
+    """
+    try:
+        p = Path(cwd).resolve()
+    except Exception:
+        return set()
+    names = set()
+    # register-style: config in the exact directory only
+    exact = _config_name(p)
+    if exact:
+        names.add(exact)
+    # myc/cx-style: nearest config walking up
+    for d in [p, *p.parents]:
+        walked = _config_name(d)
+        if walked:
+            names.add(walked)
+            break
+        if (d / ".mycelium.json").exists():
+            break
+    # positional fallback: <parent>.<project>
+    parts = p.parts
+    if len(parts) >= 2:
+        parent, proj = parts[-2], parts[-1]
+        if parent in ("Users", "home", os.environ.get("USER", "")):
+            names.add(proj.replace("/", "."))
+        else:
+            names.add(f"{parent}.{proj}")
+    return names
+
+
+def window_occupant(socket, window_id):
+    """Which agent is *actually* sitting in this window right now?
+
+    Derived from the live cwd of the LLM process in the window, not from the
+    presence registry, so it stays honest even when the registry is stale.
+
+    Note: the window-level `cwd` is the *shell's* and is useless here — it
+    stays at the login directory while the agent runs somewhere else. Only the
+    per-process cwd of the claude/codex/gemini process identifies the project.
+
+    Returns None when it can't be determined — callers must fail open and
+    deliver, since a wrong "no" would silently black-hole messages.
+    """
+    try:
+        result = subprocess.run(
+            [KITTY, "@", "--to", f"unix:{socket}", "ls"],
+            capture_output=True, text=True, timeout=3
+        )
+        data = json.loads(result.stdout)
+        for os_win in data:
+            for tab in os_win.get("tabs", []):
+                for win in tab.get("windows", []):
+                    if str(win["id"]) != str(window_id):
+                        continue
+                    procs = win.get("foreground_processes", []) or []
+                    for proc in procs:
+                        cmdline = proc.get("cmdline", []) or []
+                        if not cmdline:
+                            continue
+                        base = cmdline[0].rsplit("/", 1)[-1]
+                        is_llm = base in ("claude", "gemini", "codex") or \
+                            base.startswith("codex.js") or base.startswith("codex-")
+                        if is_llm and proc.get("cwd"):
+                            return _derive_agent_from_cwd(proc["cwd"])
+                    # No LLM process identified — don't guess from the shell.
+                    return None
+    except Exception:
+        pass
+    return None
+
+
+def presence_matches_window(client_id, occupants):
+    """True if a message for client_id belongs in a window run by `occupants`.
+
+    Worker identities are a base name plus a suffix (`helm-w98850`,
+    `integrations.camel-codex`), so a prefix match on the base is correct.
+    Empty/unknown occupants => True (fail open): a wrong rejection silently
+    black-holes messages, which is worse than the stale-delivery bug itself.
+    """
+    if not occupants:
+        return True
+    return any(client_id == o or client_id.startswith(o + "-") for o in occupants)
+
+
 def is_window_focused(socket, window_id):
     """Check if a kitty window is currently focused."""
     try:
@@ -166,6 +305,24 @@ def _format_inject(sender, topic, message, action, ref=None):
     return text
 
 
+def _fragment_in_window_tail(socket, window_id, fragment, tail_lines=12):
+    """True if `fragment` appears in the bottom `tail_lines` of the kitty
+    window's visible screen — i.e., the input box area. Used to verify that
+    send-text actually landed for TUIs (gemini-cli) that silently drop
+    keystrokes when busy. False on any kitty/timeout error.
+    """
+    try:
+        result = subprocess.run(
+            [KITTY, "@", "--to", f"unix:{socket}", "get-text",
+             "--match", f"id:{window_id}", "--extent", "screen"],
+            capture_output=True, text=True, timeout=3
+        )
+        tail = "\n".join(result.stdout.splitlines()[-tail_lines:])
+        return fragment in tail
+    except Exception:
+        return False
+
+
 def inject_kitty(socket, window_id, text, action, vim_mode=True):
     """Inject via kitty @ send-text with stepped keystrokes."""
     full_text = text
@@ -189,7 +346,15 @@ def inject_kitty(socket, window_id, text, action, vim_mode=True):
             send("\r");    time.sleep(0.3)
             send("i")
         else:
-            send(full_text); time.sleep(0.3)
+            # Non-vim (gemini-cli): TUI silently drops send-text while mid-
+            # streaming. Verify the text landed in the input area before
+            # submitting; retry once with a longer settle if not.
+            fragment = full_text[:40].split("\n")[0]
+            send(full_text); time.sleep(0.5)
+            if fragment and not _fragment_in_window_tail(socket, window_id, fragment):
+                log(f"inject retry (text didn't land in input): kitty:{window_id}")
+                time.sleep(1.5)
+                send(full_text); time.sleep(0.5)
             send("\r")
     except Exception as e:
         raise Exception(f"Kitty send-text failed: {e}")
@@ -309,12 +474,24 @@ def process_message(topic, raw_payload):
                     if not window_exists_kitty(sock, wid):
                         log(f"Kitty window {wid} for {client_id} gone, skipping")
                         continue
+                    # The window exists — but is it still this agent's window?
+                    # Presences are retained forever and windows get reused, so
+                    # a live-but-stale pointer would otherwise type one agent's
+                    # messages into whoever inherited the terminal.
+                    occupant = window_occupant(sock, wid)
+                    if not presence_matches_window(client_id, occupant):
+                        log(f"Stale presence for {client_id}: kitty:{wid} now "
+                            f"belongs to {occupant}, skipping (queued for absorb)")
+                        continue
                     # Only wait for idle if user is actively typing in this window
                     if is_window_focused(sock, wid):
                         wait_for_user_idle()
-                    log(f"Injecting into {client_id} (kitty:{wid}): {message[:60]}...")
+                    target_vim_mode = vim_mode
+                    if detect_window_llm(sock, wid) in ("gemini", "codex"):
+                        target_vim_mode = False
+                    log(f"Injecting into {client_id} (kitty:{wid}, vim={target_vim_mode}): {message[:60]}...")
                     try:
-                        inject_kitty(sock, wid, inject_text, action, vim_mode)
+                        inject_kitty(sock, wid, inject_text, action, target_vim_mode)
                     except Exception as e:
                         log(f"Injection failed for {client_id} window {wid}: {e}")
 
